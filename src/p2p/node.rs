@@ -11,7 +11,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-const BASE_TCP_PORT: u16 = 7778;
+pub const BASE_TCP_PORT: u16 = 7778;
 const TCP_PORTS_COUNT: u16 = 15;
 
 #[derive(Debug, Clone)]

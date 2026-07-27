@@ -14,7 +14,7 @@ pub struct NetworkState {
 impl Default for NetworkState {
     fn default() -> Self {
         Self {
-            remote_peer_input: "127.0.0.1:7778".to_string(),
+            remote_peer_input: String::new(),
             connect_error: None,
             gossip_logs: Vec::new(),
         }
