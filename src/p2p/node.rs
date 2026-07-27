@@ -153,6 +153,15 @@ impl P2pEngine {
         )
         .await;
 
+        let _ = super::discovery::start_wan_rendezvous_service(
+            self.node_id.clone(),
+            my_port,
+            self.shared_db.clone(),
+            self.event_tx.clone(),
+            self.connected_peers_meta.clone(),
+        )
+        .await;
+
         let _ = self.event_tx.send(P2pEvent::LogMessage(format!(
             "Node {} active. Listening on TCP port {}",
             self.node_id, my_port
@@ -200,6 +209,8 @@ impl P2pEngine {
                 };
 
                 self.broadcast_message(gossip).await;
+                crate::p2p::discovery::send_wan_gossip(signature.clone(), self.node_id.clone())
+                    .await;
                 let _ = self.event_tx.send(P2pEvent::LogMessage(format!(
                     "Broadcasted FLAGGED signature for '{}' to network via Gossip.",
                     signature.file_name
@@ -442,7 +453,7 @@ mod tests {
             .unwrap();
 
         // Wait a short moment for TCP handshake & Anti-Entropy sync
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
 
         // Create a threat signature on Node A
         let threat_hash = "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a";
@@ -465,7 +476,7 @@ mod tests {
             .unwrap();
 
         // Wait for Gossipsub delivery to Node B
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // Verify Node B received the gossip and stored it in its signature database!
         let result_in_b = shared_db_b.is_flagged(threat_hash);

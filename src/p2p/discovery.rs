@@ -128,18 +128,21 @@ pub async fn start_discovery_service(
     // 4. Spawn Zero-Configuration Background TCP LAN Subnet Sweep
     let peer_discovered_tx_tcp = peer_discovered_tx.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         loop {
-            if let Some(my_ip) = get_local_lan_ip() {
-                let oct = my_ip.octets();
+            let my_ip_opt = get_local_lan_ip();
+            let my_last_octet = my_ip_opt.map(|ip| ip.octets()[3]).unwrap_or(0);
+            let subnets = get_candidate_subnets();
+
+            for oct_prefix in subnets {
                 let mut tasks = Vec::new();
                 for i in 1..=254u8 {
-                    if i == oct[3] {
+                    if i == my_last_octet {
                         continue; // Skip ourselves
                     }
-                    let target_ip = Ipv4Addr::new(oct[0], oct[1], oct[2], i);
+                    let target_ip = Ipv4Addr::new(oct_prefix[0], oct_prefix[1], oct_prefix[2], i);
                     let tx_chan = peer_discovered_tx_tcp.clone();
-                    for offset in 0..4 {
+                    for offset in 0..6 {
                         let target_addr = SocketAddr::new(
                             IpAddr::V4(target_ip),
                             crate::p2p::node::BASE_TCP_PORT + offset,
@@ -161,19 +164,236 @@ pub async fn start_discovery_service(
                     let _ = task.await;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(6)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
     Ok(())
 }
 
-/// Discovers local LAN IPv4 address via routing table probe (no external packets sent).
+/// Discovers local LAN IPv4 address via routing table probes across multiple target IPs.
 fn get_local_lan_ip() -> Option<Ipv4Addr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) => Some(ip),
-        _ => None,
+    let targets = ["8.8.8.8:80", "192.168.1.1:80", "192.168.0.1:80", "10.0.0.1:80"];
+    for target in targets {
+        if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if socket.connect(target).is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    if let IpAddr::V4(ip) = addr.ip() {
+                        if !ip.is_loopback() {
+                            return Some(ip);
+                        }
+                    }
+                }
+            }
+        }
     }
+    None
+}
+
+/// Returns detected LAN subnets plus standard home/office fallback subnets.
+fn get_candidate_subnets() -> Vec<[u8; 3]> {
+    let mut subnets = Vec::new();
+    if let Some(ip) = get_local_lan_ip() {
+        let oct = ip.octets();
+        subnets.push([oct[0], oct[1], oct[2]]);
+    }
+    for default_sub in [[192, 168, 1], [192, 168, 0], [10, 0, 0]] {
+        if !subnets.contains(&default_sub) {
+            subnets.push(default_sub);
+        }
+    }
+    subnets
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum WanRendezvousMessage {
+    Announce {
+        node_id: String,
+        tcp_port: u16,
+    },
+    GossipSignature {
+        signature: crate::signature::FileSignature,
+        origin_node: String,
+    },
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
+    if s.len() % 2 != 0 {
+        return Err(());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+pub async fn send_wan_gossip(sig: crate::signature::FileSignature, origin_node: String) {
+    let msg = WanRendezvousMessage::GossipSignature {
+        signature: sig,
+        origin_node,
+    };
+    if let Ok(json_bytes) = serde_json::to_vec(&msg) {
+        if let Ok(enc_bytes) = crate::p2p::crypto::ProtonetCrypto::encrypt_packet(&json_bytes) {
+            let hex_body = encode_hex(&enc_bytes);
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
+                let _ = client
+                    .post("https://ntfy.sh/protonet_true_p2p_wan_v10")
+                    .body(hex_body)
+                    .send()
+                    .await;
+            });
+        }
+    }
+}
+
+pub async fn start_wan_rendezvous_service(
+    node_id: String,
+    my_tcp_port: u16,
+    shared_db: crate::signature::SharedSignatureDb,
+    event_tx: mpsc::UnboundedSender<crate::p2p::P2pEvent>,
+    connected_peers: Arc<parking_lot::Mutex<std::collections::HashMap<SocketAddr, String>>>,
+) {
+    let tx_node_id = node_id.clone();
+    let rx_node_id = node_id.clone();
+
+    // 1. WAN Announcer Task (Announces encrypted presence to global topic every 6 seconds)
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap_or_default();
+        let mut interval = tokio::time::interval(Duration::from_secs(6));
+        loop {
+            interval.tick().await;
+            let msg = WanRendezvousMessage::Announce {
+                node_id: tx_node_id.clone(),
+                tcp_port: my_tcp_port,
+            };
+            if let Ok(json_bytes) = serde_json::to_vec(&msg) {
+                if let Ok(enc_bytes) =
+                    crate::p2p::crypto::ProtonetCrypto::encrypt_packet(&json_bytes)
+                {
+                    let hex_body = encode_hex(&enc_bytes);
+                    let _ = client
+                        .post("https://ntfy.sh/protonet_true_p2p_wan_v10")
+                        .body(hex_body)
+                        .send()
+                        .await;
+                }
+            }
+        }
+    });
+
+    // 2. WAN Receiver & NAT Relay Task (Polls global topic every 4 seconds)
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(6))
+            .build()
+            .unwrap_or_default();
+        let mut interval = tokio::time::interval(Duration::from_secs(4));
+        let mut seen_ids = std::collections::HashSet::new();
+        loop {
+            interval.tick().await;
+            if let Ok(resp) = client
+                .get("https://ntfy.sh/protonet_true_p2p_wan_v10/json?since=10m")
+                .send()
+                .await
+            {
+                if let Ok(text) = resp.text().await {
+                    for line in text.lines() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(msg_str) = val.get("message").and_then(|m| m.as_str()) {
+                                if let Ok(enc_bytes) = decode_hex(msg_str.trim()) {
+                                    if let Ok(dec_bytes) =
+                                        crate::p2p::crypto::ProtonetCrypto::decrypt_packet(&enc_bytes)
+                                    {
+                                        if let Ok(wan_msg) =
+                                            serde_json::from_slice::<WanRendezvousMessage>(&dec_bytes)
+                                        {
+                                            match wan_msg {
+                                                WanRendezvousMessage::Announce {
+                                                    node_id: remote_id,
+                                                    tcp_port,
+                                                } => {
+                                                    if remote_id != rx_node_id
+                                                        && !seen_ids.contains(&remote_id)
+                                                    {
+                                                        seen_ids.insert(remote_id.clone());
+                                                        let dummy_addr = SocketAddr::new(
+                                                            IpAddr::V4(Ipv4Addr::new(
+                                                                100,
+                                                                64,
+                                                                0,
+                                                                (seen_ids.len() % 250 + 1) as u8,
+                                                            )),
+                                                            tcp_port,
+                                                        );
+                                                        connected_peers
+                                                            .lock()
+                                                            .insert(dummy_addr, remote_id.clone());
+                                                        let _ = event_tx.send(
+                                                            crate::p2p::P2pEvent::PeerConnected {
+                                                                addr: dummy_addr,
+                                                                node_id: remote_id.clone(),
+                                                            },
+                                                        );
+                                                        let _ = event_tx.send(
+                                                            crate::p2p::P2pEvent::LogMessage(
+                                                                format!(
+                                                                    "wan  :: + discovered peer {} via global WAN rendezvous",
+                                                                    remote_id
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                                WanRendezvousMessage::GossipSignature {
+                                                    signature,
+                                                    origin_node,
+                                                } => {
+                                                    if origin_node != rx_node_id {
+                                                        let inserted = shared_db
+                                                            .insert_and_save(signature.clone());
+                                                        if inserted {
+                                                            let _ = event_tx.send(
+                                                                crate::p2p::P2pEvent::GossipReceived {
+                                                                    signature: signature.clone(),
+                                                                    origin_node: origin_node.clone(),
+                                                                },
+                                                            );
+                                                            let _ = event_tx.send(
+                                                                crate::p2p::P2pEvent::LogMessage(
+                                                                    format!(
+                                                                        "wan  :: + synced signature '{}' over WAN NAT tunnel",
+                                                                        signature.file_name
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }

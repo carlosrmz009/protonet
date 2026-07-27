@@ -1,4 +1,4 @@
-use crate::p2p::{P2pCommand, P2pEvent, P2pHandle};
+use crate::p2p::{P2pEvent, P2pHandle};
 use crate::signature::{FileSignature, SharedSignatureDb};
 use crate::ui::{
     apply_theme, handle_file_chosen, render_red_alert_screen, NetworkState, ScannerState,
@@ -6,7 +6,6 @@ use crate::ui::{
 };
 use eframe::App;
 use egui::{Align, Color32, Frame, Layout, RichText, Rounding, Vec2};
-use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
 pub struct ProtonetApp {
@@ -162,43 +161,6 @@ impl App for ProtonetApp {
                         if ui.add(topology_btn).clicked() {
                             self.show_peers_window = !self.show_peers_window;
                         }
-
-                        ui.add_space(12.0);
-
-                        // Quick Connect Input
-                        let connect_btn = egui::Button::new(
-                            RichText::new("[connect]")
-                                .font(ThemeColors::font_regular(13.0))
-                                .color(ThemeColors::TEXT_MUTED),
-                        )
-                        .fill(ThemeColors::BG_CARD)
-                        .frame(false);
-
-                        if ui.add(connect_btn).clicked() {
-                            if let Ok(addr) =
-                                self.network_state.remote_peer_input.parse::<SocketAddr>()
-                            {
-                                let _ = self
-                                    .p2p_handle
-                                    .cmd_tx
-                                    .try_send(P2pCommand::ConnectRemote(addr));
-                                self.network_state
-                                    .gossip_logs
-                                    .push(format!("p2p  :: connecting to {}...", addr));
-                                self.network_state.remote_peer_input.clear();
-                            } else {
-                                self.network_state
-                                    .gossip_logs
-                                    .push("sys  :: invalid ip:port address".to_string());
-                            }
-                        }
-
-                        ui.add_sized(
-                            Vec2::new(130.0, 22.0),
-                            egui::TextEdit::singleline(&mut self.network_state.remote_peer_input)
-                                .hint_text("ip:port")
-                                .font(ThemeColors::font_regular(13.0)),
-                        );
                     });
                 });
 
