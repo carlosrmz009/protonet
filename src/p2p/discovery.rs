@@ -96,7 +96,7 @@ pub async fn start_discovery_service(
                             serde_json::from_slice::<DiscoveryBeacon>(&dec_bytes)
                         {
                             // Skip beacons from ourselves
-                            if beacon.node_id != rx_node_id && beacon.tcp_port != my_tcp_port {
+                            if beacon.node_id != rx_node_id {
                                 let candidate_tcp_addr =
                                     SocketAddr::new(remote_addr.ip(), beacon.tcp_port);
                                 debug!(

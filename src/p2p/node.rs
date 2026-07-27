@@ -50,17 +50,25 @@ pub struct P2pHandle {
 }
 
 impl P2pHandle {
-    pub fn peer_count(&self) -> usize {
-        self.connected_peers.lock().len()
+    pub fn get_peers_info(&self) -> Vec<(SocketAddr, String)> {
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for (&addr, id) in self.connected_peers.lock().iter() {
+            if id != &self.node_id
+                && !id.is_empty()
+                && id != "unknown"
+                && seen_ids.insert(id.clone())
+            {
+                result.push((addr, id.clone()));
+            } else if (id.is_empty() || id == "unknown") && id != &self.node_id {
+                result.push((addr, id.clone()));
+            }
+        }
+        result
     }
 
-    #[allow(dead_code)]
-    pub fn get_peers_info(&self) -> Vec<(SocketAddr, String)> {
-        self.connected_peers
-            .lock()
-            .iter()
-            .map(|(&addr, id)| (addr, id.clone()))
-            .collect()
+    pub fn peer_count(&self) -> usize {
+        self.get_peers_info().len()
     }
 }
 
@@ -293,6 +301,10 @@ impl P2pEngine {
                         P2pMessage::Handshake {
                             node_id: remote_id, ..
                         } => {
+                            if remote_id == _node_id {
+                                connected_senders.lock().remove(&remote_addr);
+                                break;
+                            }
                             peer_node_id = remote_id.clone();
                             connected_peers_meta
                                 .lock()
@@ -383,11 +395,13 @@ impl P2pEngine {
             // Cleanup when stream closes
             connected_senders.lock().remove(&remote_addr);
             connected_peers_meta.lock().remove(&remote_addr);
-            let _ = event_tx.send(P2pEvent::PeerDisconnected { addr: remote_addr });
-            let _ = event_tx.send(P2pEvent::LogMessage(format!(
-                "Disconnected from peer {} ({})",
-                peer_node_id, remote_addr
-            )));
+            if peer_node_id != "unknown" {
+                let _ = event_tx.send(P2pEvent::PeerDisconnected { addr: remote_addr });
+                let _ = event_tx.send(P2pEvent::LogMessage(format!(
+                    "Disconnected from peer {} ({})",
+                    peer_node_id, remote_addr
+                )));
+            }
         });
     }
 }
