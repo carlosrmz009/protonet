@@ -250,7 +250,7 @@ pub async fn send_wan_gossip(sig: crate::signature::FileSignature, origin_node: 
                     .build()
                     .unwrap_or_default();
                 let _ = client
-                    .post("https://ntfy.sh/protonet_true_p2p_wan_v10")
+                    .post("https://ntfy.sh/protonet_true_p2p_wan_v15")
                     .body(hex_body)
                     .send()
                     .await;
@@ -288,7 +288,7 @@ pub async fn start_wan_rendezvous_service(
                 {
                     let hex_body = encode_hex(&enc_bytes);
                     let _ = client
-                        .post("https://ntfy.sh/protonet_true_p2p_wan_v10")
+                        .post("https://ntfy.sh/protonet_true_p2p_wan_v15")
                         .body(hex_body)
                         .send()
                         .await;
@@ -308,7 +308,7 @@ pub async fn start_wan_rendezvous_service(
         loop {
             interval.tick().await;
             if let Ok(resp) = client
-                .get("https://ntfy.sh/protonet_true_p2p_wan_v10/json?since=10m")
+                .get("https://ntfy.sh/protonet_true_p2p_wan_v15/json?since=20m&poll=1")
                 .send()
                 .await
             {

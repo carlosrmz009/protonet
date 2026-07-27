@@ -30,7 +30,7 @@ impl ProtonetApp {
 
         let mut network_state = NetworkState::default();
         network_state.gossip_logs.push(format!(
-            "sys  :: protonet v0.0.5 ({})",
+            "sys  :: protonet v0.1.0 ({})",
             p2p_handle.node_id
         ));
         network_state.gossip_logs.push(
@@ -126,7 +126,7 @@ impl App for ProtonetApp {
                 // --- Top Header Row ---
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("protonet v0.0.5")
+                        RichText::new("protonet v0.1.0")
                             .font(ThemeColors::font_bold(32.0))
                             .color(Color32::WHITE),
                     );
