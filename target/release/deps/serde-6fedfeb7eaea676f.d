@@ -1,0 +1,14 @@
+C:\Users\mhdiseño\Documents\protonet\target\release\deps\serde-6fedfeb7eaea676f.d: C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Users\mhdiseño\Documents\protonet\target\release\build\serde-8b8c7669a20251bd\out/private.rs
+
+C:\Users\mhdiseño\Documents\protonet\target\release\deps\libserde-6fedfeb7eaea676f.rlib: C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Users\mhdiseño\Documents\protonet\target\release\build\serde-8b8c7669a20251bd\out/private.rs
+
+C:\Users\mhdiseño\Documents\protonet\target\release\deps\libserde-6fedfeb7eaea676f.rmeta: C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Users\mhdiseño\Documents\protonet\target\release\build\serde-8b8c7669a20251bd\out/private.rs
+
+C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\mhdiseño\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+C:\Users\mhdiseño\Documents\protonet\target\release\build\serde-8b8c7669a20251bd\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Users\\mhdiseño\\Documents\\protonet\\target\\release\\build\\serde-8b8c7669a20251bd\\out
