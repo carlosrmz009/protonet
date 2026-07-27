@@ -48,14 +48,17 @@ impl TopologyState {
         handle
     }
 
-    pub fn trigger_broadcast(&mut self, total_peers: usize) {
-        for i in 0..total_peers {
+    pub fn trigger_broadcast(&mut self, total_peers: usize, ctx: &egui::Context) {
+        let count = total_peers.max(1);
+        for i in 0..count {
             self.active_animations.push(BroadcastAnim {
                 peer_index: i,
                 progress: 0.0,
-                speed: 1.5,
+                speed: 0.75,
             });
         }
+        ctx.request_repaint();
+        ctx.request_repaint_of(egui::ViewportId::from_hash_of("peers_topology_window"));
     }
 }
 
@@ -171,25 +174,29 @@ pub fn render_topology_window(
             let mut has_active_animation = false;
 
             for anim in &mut state.active_animations {
-                if let Some(&target_pos) = peer_positions.get(anim.peer_index) {
-                    if anim.progress <= 1.0 {
-                        anim.progress += dt * anim.speed;
-                        has_active_animation = true;
+                let target_pos = if !peer_positions.is_empty() {
+                    peer_positions[anim.peer_index % peer_positions.len()]
+                } else {
+                    center + Vec2::new(0.0, -140.0)
+                };
 
-                        let circle_pos = center.lerp(target_pos, anim.progress.clamp(0.0, 1.0));
+                if anim.progress <= 1.0 {
+                    anim.progress += dt * anim.speed;
+                    has_active_animation = true;
 
-                        // Bright green circle
-                        painter.circle_filled(
-                            circle_pos,
-                            11.0,
-                            Color32::from_rgb(100, 210, 80),
-                        );
-                        painter.circle_stroke(
-                            circle_pos,
-                            11.0,
-                            Stroke::new(2.0_f32, Color32::from_rgb(40, 140, 30)),
-                        );
-                    }
+                    let circle_pos = center.lerp(target_pos, anim.progress.clamp(0.0, 1.0));
+
+                    // Bright green circle
+                    painter.circle_filled(
+                        circle_pos,
+                        13.0,
+                        Color32::from_rgb(100, 235, 80),
+                    );
+                    painter.circle_stroke(
+                        circle_pos,
+                        13.0,
+                        Stroke::new(2.5_f32, Color32::from_rgb(40, 160, 30)),
+                    );
                 }
             }
 

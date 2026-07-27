@@ -45,6 +45,7 @@ impl FileSignature {
     }
 
     /// Formats file size into human readable string (e.g., "1.45 MB")
+    #[allow(dead_code)]
     pub fn formatted_size(&self) -> String {
         format_bytes(self.file_size)
     }
@@ -82,6 +83,7 @@ pub fn compute_file_hash_and_meta(path: &Path) -> anyhow::Result<(String, String
     Ok((hash_hex, file_name, file_size))
 }
 
+#[allow(dead_code)]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

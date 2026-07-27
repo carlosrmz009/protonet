@@ -32,6 +32,15 @@ impl SharedSignatureDb {
         added
     }
 
+    pub fn remove_and_save(&self, hash: &str) -> bool {
+        let mut guard = self.inner.write();
+        let removed = guard.remove(hash);
+        if removed {
+            let _ = guard.save_to_disk(&self.disk_path);
+        }
+        removed
+    }
+
     pub fn is_flagged(&self, blake3_hash: &str) -> Option<FileSignature> {
         self.inner.read().get(blake3_hash)
     }
@@ -75,6 +84,10 @@ impl SignatureDatabase {
             self.signatures.insert(sig.blake3_hash.clone(), sig);
             true
         }
+    }
+
+    pub fn remove(&mut self, hash: &str) -> bool {
+        self.signatures.remove(hash).is_some()
     }
 
     pub fn get(&self, hash: &str) -> Option<FileSignature> {

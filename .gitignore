@@ -1,0 +1,9 @@
+/target
+target/
+**/*.pdb
+**/*.exe
+**/*.dll
+**/*.lib
+signatures.json
+*.log
+.DS_Store

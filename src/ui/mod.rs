@@ -1,9 +1,12 @@
+pub mod manage_signatures;
 pub mod network_panel;
 pub mod red_alert;
 pub mod scanner_panel;
 pub mod theme;
 pub mod topology;
 
+#[allow(unused_imports)]
+pub use manage_signatures::render_manage_signatures_tab;
 #[allow(unused_imports)]
 pub use network_panel::{render_network_panel, NetworkState};
 #[allow(unused_imports)]

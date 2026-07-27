@@ -5,8 +5,14 @@ use crate::ui::{
     ThemeColors,
 };
 use eframe::App;
-use egui::{Align, Color32, Frame, Layout, RichText, Rounding, Vec2};
+use egui::{Align, Color32, Frame, Layout, RichText, Rounding, Stroke, Vec2};
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTab {
+    Scanner,
+    ManageSignatures,
+}
 
 pub struct ProtonetApp {
     p2p_handle: P2pHandle,
@@ -17,6 +23,7 @@ pub struct ProtonetApp {
     pub active_threat_alert: Option<FileSignature>,
     pub show_peers_window: bool,
     pub topology_state: crate::ui::TopologyState,
+    pub active_tab: AppTab,
 }
 
 impl ProtonetApp {
@@ -60,6 +67,7 @@ impl ProtonetApp {
             active_threat_alert: None,
             show_peers_window: true,
             topology_state: crate::ui::TopologyState::default(),
+            active_tab: AppTab::Scanner,
         }
     }
 
@@ -164,58 +172,134 @@ impl App for ProtonetApp {
                     });
                 });
 
-                ui.add_space(28.0);
+                ui.add_space(20.0);
 
-                // --- The Huge Neon Yellow Action Button ---
-                let button_width = ui.available_width();
-                let choose_btn = egui::Button::new(
-                    RichText::new("choose file...")
-                        .font(ThemeColors::font_bold(36.0))
-                        .color(Color32::BLACK),
-                )
-                .fill(ThemeColors::NEON_YELLOW)
-                .rounding(Rounding::same(28.0))
-                .min_size(Vec2::new(button_width, 140.0));
+                // --- Sleek Tab Bar ---
+                ui.horizontal(|ui| {
+                    let scanner_btn = egui::Button::new(
+                        RichText::new("🔍 THREAT SCANNER")
+                            .font(ThemeColors::font_bold(14.0))
+                            .color(if self.active_tab == AppTab::Scanner {
+                                Color32::WHITE
+                            } else {
+                                ThemeColors::TEXT_MUTED
+                            }),
+                    )
+                    .fill(if self.active_tab == AppTab::Scanner {
+                        Color32::from_rgb(45, 45, 55)
+                    } else {
+                        ThemeColors::BG_CARD
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if self.active_tab == AppTab::Scanner {
+                            ThemeColors::ACCENT_CYAN
+                        } else {
+                            ThemeColors::BORDER_MUTED
+                        },
+                    ))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(180.0, 36.0));
 
-                if ui.add(choose_btn).clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        handle_file_chosen(
-                            path,
-                            &self.shared_db,
-                            &self.p2p_handle,
-                            &mut self.scanner_state,
-                            &mut self.active_threat_alert,
-                            &mut self.network_state.gossip_logs,
-                        );
-                        let total_peers = self.p2p_handle.peer_count();
-                        self.topology_state.trigger_broadcast(total_peers);
+                    if ui.add(scanner_btn).clicked() {
+                        self.active_tab = AppTab::Scanner;
                     }
-                }
+
+                    ui.add_space(10.0);
+
+                    let manage_btn = egui::Button::new(
+                        RichText::new("🗑 MANAGE FLAGGED FILES")
+                            .font(ThemeColors::font_bold(14.0))
+                            .color(if self.active_tab == AppTab::ManageSignatures {
+                                Color32::WHITE
+                            } else {
+                                ThemeColors::TEXT_MUTED
+                            }),
+                    )
+                    .fill(if self.active_tab == AppTab::ManageSignatures {
+                        Color32::from_rgb(45, 45, 55)
+                    } else {
+                        ThemeColors::BG_CARD
+                    })
+                    .stroke(Stroke::new(
+                        1.0_f32,
+                        if self.active_tab == AppTab::ManageSignatures {
+                            ThemeColors::ACCENT_CYAN
+                        } else {
+                            ThemeColors::BORDER_MUTED
+                        },
+                    ))
+                    .rounding(Rounding::same(6.0))
+                    .min_size(Vec2::new(220.0, 36.0));
+
+                    if ui.add(manage_btn).clicked() {
+                        self.active_tab = AppTab::ManageSignatures;
+                    }
+                });
 
                 ui.add_space(24.0);
 
-                // --- The Charcoal Grey Log Text Box ---
-                let log_box_frame = Frame::none()
-                    .fill(ThemeColors::BG_LOG_BOX)
-                    .inner_margin(24.0)
-                    .rounding(Rounding::same(4.0));
+                match self.active_tab {
+                    AppTab::Scanner => {
+                        // --- The Huge Neon Yellow Action Button ---
+                        let button_width = ui.available_width();
+                        let choose_btn = egui::Button::new(
+                            RichText::new("choose file...")
+                                .font(ThemeColors::font_bold(36.0))
+                                .color(Color32::BLACK),
+                        )
+                        .fill(ThemeColors::NEON_YELLOW)
+                        .rounding(Rounding::same(28.0))
+                        .min_size(Vec2::new(button_width, 140.0));
 
-                log_box_frame.show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            for log_line in &self.network_state.gossip_logs {
-                                ui.label(
-                                    RichText::new(log_line)
-                                        .font(ThemeColors::font_regular(16.0))
-                                        .color(Color32::from_rgb(240, 240, 240)),
+                        if ui.add(choose_btn).clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                handle_file_chosen(
+                                    path,
+                                    &self.shared_db,
+                                    &self.p2p_handle,
+                                    &mut self.scanner_state,
+                                    &mut self.active_threat_alert,
+                                    &mut self.network_state.gossip_logs,
                                 );
-                                ui.add_space(4.0);
+                                let total_peers = self.p2p_handle.peer_count();
+                                self.topology_state.trigger_broadcast(total_peers, ctx);
                             }
+                        }
+
+                        ui.add_space(24.0);
+
+                        // --- The Charcoal Grey Log Text Box ---
+                        let log_box_frame = Frame::none()
+                            .fill(ThemeColors::BG_LOG_BOX)
+                            .inner_margin(24.0)
+                            .rounding(Rounding::same(4.0));
+
+                        log_box_frame.show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .stick_to_bottom(true)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    for log_line in &self.network_state.gossip_logs {
+                                        ui.label(
+                                            RichText::new(log_line)
+                                                .font(ThemeColors::font_regular(16.0))
+                                                .color(Color32::from_rgb(240, 240, 240)),
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                });
                         });
-                });
+                    }
+                    AppTab::ManageSignatures => {
+                        crate::ui::render_manage_signatures_tab(
+                            ui,
+                            &self.shared_db,
+                            &mut self.network_state.gossip_logs,
+                        );
+                    }
+                }
             });
 
         if self.show_peers_window {
