@@ -10,7 +10,6 @@ pub fn render_manage_signatures_tab(
     let all_sigs = shared_db.get_all_signatures();
     let count = all_sigs.len();
 
-    // Top description banner
     let banner_frame = Frame::none()
         .fill(ThemeColors::BG_CARD)
         .stroke(Stroke::new(1.0_f32, ThemeColors::BORDER_MUTED))
@@ -26,7 +25,7 @@ pub fn render_manage_signatures_tab(
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new(&format!("TOTAL FLAGGED: {}", count))
+                    RichText::new(format!("TOTAL FLAGGED: {}", count))
                         .font(ThemeColors::font_bold(14.0))
                         .color(ThemeColors::ACCENT_EMERALD),
                 );
@@ -84,13 +83,13 @@ pub fn render_manage_signatures_tab(
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(&format!("BLAKE3 :: {}", sig.blake3_hash))
+                                RichText::new(format!("BLAKE3 :: {}", sig.blake3_hash))
                                     .font(ThemeColors::font_regular(12.0))
                                     .color(ThemeColors::ACCENT_CYAN),
                             );
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(&format!(
+                                RichText::new(format!(
                                     "FLAGGED BY :: {}   |   LEVEL :: {}",
                                     sig.flagged_by_peer, sig.threat_level
                                 ))

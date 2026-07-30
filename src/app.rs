@@ -17,13 +17,14 @@ pub enum AppTab {
 pub struct ProtonetApp {
     p2p_handle: P2pHandle,
     shared_db: SharedSignatureDb,
-    event_rx: mpsc::UnboundedReceiver<P2pEvent>,
+    event_rx: mpsc::Receiver<P2pEvent>,
     scanner_state: ScannerState,
     network_state: NetworkState,
     pub active_threat_alert: Option<FileSignature>,
     pub show_peers_window: bool,
     pub topology_state: crate::ui::TopologyState,
     pub active_tab: AppTab,
+    pub show_reset_identity_confirmation: bool,
 }
 
 impl ProtonetApp {
@@ -31,32 +32,26 @@ impl ProtonetApp {
         cc: &eframe::CreationContext<'_>,
         p2p_handle: P2pHandle,
         shared_db: SharedSignatureDb,
-        event_rx: mpsc::UnboundedReceiver<P2pEvent>,
+        event_rx: mpsc::Receiver<P2pEvent>,
     ) -> Self {
         apply_theme(&cc.egui_ctx);
 
         let mut network_state = NetworkState::default();
-        network_state.gossip_logs.push(format!(
+        network_state.push_log(format!(
             "sys  :: protonet v0.1.0 ({})",
-            p2p_handle.node_id
+            p2p_handle
+                .local_peer_id()
+                .map(|peer| peer.to_string())
+                .unwrap_or_else(|| "initializing".to_owned())
         ));
-        network_state.gossip_logs.push(
-            "lock :: encrypted transport active".to_string(),
-        );
-        network_state.gossip_logs.push(format!(
-            "udp  :: discovery on port 7777"
-        ));
-        network_state.gossip_logs.push(format!(
-            "tcp  :: listening on port {}",
-            p2p_handle.listen_port
-        ));
-        network_state.gossip_logs.push(format!(
+        network_state.push_log("lock :: encrypted transport active".to_string());
+        network_state
+            .push_log("net  :: QUIC preferred; Noise/TCP and encrypted relay fallback".to_owned());
+        network_state.push_log(format!(
             "db   :: {} flagged signatures loaded",
             shared_db.count()
         ));
-        network_state.gossip_logs.push(
-            "ready!".to_string(),
-        );
+        network_state.push_log("ready!".to_string());
 
         Self {
             p2p_handle,
@@ -68,41 +63,79 @@ impl ProtonetApp {
             show_peers_window: true,
             topology_state: crate::ui::TopologyState::default(),
             active_tab: AppTab::Scanner,
+            show_reset_identity_confirmation: false,
         }
     }
 
     fn poll_p2p_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                P2pEvent::PeerConnected { addr, node_id } => {
-                    self.network_state
-                        .gossip_logs
-                        .push(format!("p2p  :: + connected to peer {} ({})", node_id, addr));
+                P2pEvent::Started { peer_id } => {
+                    self.network_state.push_log(format!("id   :: {}", peer_id));
                 }
-                P2pEvent::PeerDisconnected { addr } => {
+                P2pEvent::IdentityReset { peer_id } => {
                     self.network_state
-                        .gossip_logs
-                        .push(format!("p2p  :: - peer disconnected: {}", addr));
+                        .push_log(format!("id   :: identity reset to {}", peer_id));
                 }
-                P2pEvent::GossipReceived {
-                    signature,
-                    origin_node,
+                P2pEvent::Listening { address } => {
+                    self.network_state.push_log(format!("listen:: {}", address));
+                }
+                P2pEvent::PeerConnected {
+                    peer_id,
+                    address,
+                    directness,
+                    transport,
                 } => {
-                    self.network_state.gossip_logs.push(format!(
-                        "recv :: '{}' flagged by {}",
-                        signature.file_name, origin_node
+                    self.network_state.push_log(format!(
+                        "p2p  :: + {} at {} ({:?}, {:?})",
+                        peer_id, address, directness, transport
                     ));
                 }
-                P2pEvent::SyncCompleted {
-                    new_signatures_count,
+                P2pEvent::PeerDisconnected { peer_id } => {
+                    self.network_state
+                        .push_log(format!("p2p  :: - {}", peer_id));
+                }
+                P2pEvent::RecordReceived {
+                    record_id,
+                    from,
+                    file_name,
                 } => {
-                    self.network_state.gossip_logs.push(format!(
-                        "sync :: {} new signatures synced",
-                        new_signatures_count
+                    self.network_state.push_log(format!(
+                        "recv :: '{}' [{}] from {}",
+                        file_name.unwrap_or_else(|| "unnamed file".to_owned()),
+                        short_record_id(&record_id),
+                        from
                     ));
                 }
+                P2pEvent::RecordPublished {
+                    record_id,
+                    file_name,
+                } => self.network_state.push_log(format!(
+                    "send :: '{}' [{}]",
+                    file_name.unwrap_or_else(|| "unnamed file".to_owned()),
+                    short_record_id(&record_id)
+                )),
+                P2pEvent::SyncStarted { peer_id } => self
+                    .network_state
+                    .push_log(format!("sync :: started with {}", peer_id)),
+                P2pEvent::SyncProgress { peer_id, received } => self
+                    .network_state
+                    .push_log(format!("sync :: {} records from {}", received, peer_id)),
+                P2pEvent::SyncCompleted { peer_id, received } => self.network_state.push_log(
+                    format!("sync :: completed with {} ({} new)", peer_id, received),
+                ),
+                P2pEvent::ProtocolViolation { peer_id, reason } => {
+                    self.network_state.push_log(format!(
+                        "deny :: {}{}",
+                        peer_id.map(|p| format!("{p}: ")).unwrap_or_default(),
+                        reason
+                    ))
+                }
+                P2pEvent::ReachabilityChanged { state } => self
+                    .network_state
+                    .push_log(format!("nat  :: reachability is {:?}", state)),
                 P2pEvent::LogMessage(msg) => {
-                    self.network_state.gossip_logs.push(format!("log  :: {}", msg));
+                    self.network_state.push_log(format!("log  :: {}", msg));
                 }
             }
         }
@@ -113,7 +146,6 @@ impl App for ProtonetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_p2p_events();
 
-        // 1. Check if we have an ACTIVE FLAGGED THREAT ALERT
         if let Some(signature) = self.active_threat_alert.clone() {
             let mut on_dismiss = false;
             render_red_alert_screen(ctx, &signature, &mut on_dismiss);
@@ -123,15 +155,9 @@ impl App for ProtonetApp {
             return;
         }
 
-        // 2. Main Retro-Hacker JetBrains Mono Interface
         egui::CentralPanel::default()
-            .frame(
-                Frame::none()
-                    .fill(ThemeColors::BG_MAIN)
-                    .inner_margin(28.0),
-            )
+            .frame(Frame::none().fill(ThemeColors::BG_MAIN).inner_margin(28.0))
             .show(ctx, |ui| {
-                // --- Top Header Row ---
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("protonet v0.1.0")
@@ -140,9 +166,8 @@ impl App for ProtonetApp {
                     );
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Status info badge on the far right
                         ui.label(
-                            RichText::new(&format!(
+                            RichText::new(format!(
                                 "[peers: {} | flagged: {}]",
                                 self.p2p_handle.peer_count(),
                                 self.shared_db.count()
@@ -153,7 +178,6 @@ impl App for ProtonetApp {
 
                         ui.add_space(16.0);
 
-                        // Peers Window Toggle
                         let topology_btn = egui::Button::new(
                             RichText::new("[peers]")
                                 .font(ThemeColors::font_regular(13.0))
@@ -169,12 +193,23 @@ impl App for ProtonetApp {
                         if ui.add(topology_btn).clicked() {
                             self.show_peers_window = !self.show_peers_window;
                         }
+
+                        ui.add_space(8.0);
+                        if ui
+                            .button(
+                                RichText::new("[reset identity]")
+                                    .font(ThemeColors::font_regular(12.0))
+                                    .color(ThemeColors::ACCENT_DANGER),
+                            )
+                            .clicked()
+                        {
+                            self.show_reset_identity_confirmation = true;
+                        }
                     });
                 });
 
                 ui.add_space(20.0);
 
-                // --- Sleek Tab Bar ---
                 ui.horizontal(|ui| {
                     let scanner_btn = egui::Button::new(
                         RichText::new("🔍 THREAT SCANNER")
@@ -241,7 +276,6 @@ impl App for ProtonetApp {
 
                 match self.active_tab {
                     AppTab::Scanner => {
-                        // --- The Huge Neon Yellow Action Button ---
                         let button_width = ui.available_width();
                         let choose_btn = egui::Button::new(
                             RichText::new("choose file...")
@@ -269,7 +303,6 @@ impl App for ProtonetApp {
 
                         ui.add_space(24.0);
 
-                        // --- The Charcoal Grey Log Text Box ---
                         let log_box_frame = Frame::none()
                             .fill(ThemeColors::BG_LOG_BOX)
                             .inner_margin(24.0)
@@ -311,7 +344,34 @@ impl App for ProtonetApp {
             );
         }
 
-        // Repaint periodically so UI updates instantly when P2P events arrive
+        if self.show_reset_identity_confirmation {
+            egui::Window::new("Reset Protonet identity")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("This disconnects peers, creates a new PeerId, and clears replay/sequence state.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.show_reset_identity_confirmation = false;
+                        }
+                        if ui
+                            .button(RichText::new("Reset identity").color(ThemeColors::ACCENT_DANGER))
+                            .clicked()
+                        {
+                            let _ = self
+                                .p2p_handle
+                                .cmd_tx
+                                .try_send(crate::p2p::P2pCommand::ResetIdentity);
+                            self.show_reset_identity_confirmation = false;
+                        }
+                    });
+                });
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+fn short_record_id(id: &[u8; 32]) -> String {
+    id[..4].iter().map(|byte| format!("{byte:02x}")).collect()
 }

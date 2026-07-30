@@ -4,15 +4,12 @@ pub struct ThemeColors;
 
 #[allow(dead_code)]
 impl ThemeColors {
-    // Pitch black main background matching the user screenshot
     pub const BG_MAIN: Color32 = Color32::from_rgb(0, 0, 0);
-    // Dark grey background box for log text container
     pub const BG_LOG_BOX: Color32 = Color32::from_rgb(34, 34, 34);
     pub const BG_CARD: Color32 = Color32::from_rgb(26, 26, 26);
     pub const BG_ELEVATED: Color32 = Color32::from_rgb(40, 40, 40);
     pub const BORDER_MUTED: Color32 = Color32::from_rgb(50, 50, 50);
 
-    // Neon Yellow button color matching the user screenshot
     pub const NEON_YELLOW: Color32 = Color32::from_rgb(255, 248, 0);
     pub const NEON_YELLOW_HOVER: Color32 = Color32::from_rgb(255, 255, 60);
 

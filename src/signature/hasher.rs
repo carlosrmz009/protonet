@@ -1,30 +1,23 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileSignature {
-    /// 64-character lowercase hex string of BLAKE3 hash
     pub blake3_hash: String,
-    /// Name of the flagged file
     pub file_name: String,
-    /// File size in bytes
     pub file_size: u64,
-    /// Node / Peer ID that flagged this threat
     pub flagged_by_peer: String,
-    /// UTC timestamp when flagged
     pub flagged_at: DateTime<Utc>,
-    /// Threat description or flag reason
     pub reason: String,
-    /// Severity classification (e.g., "HIGH - P2P CONFIRMED", "CRITICAL THREAT")
     pub threat_level: String,
 }
 
 impl FileSignature {
-    /// Computes the BLAKE3 cryptographic hash and metadata for any file on disk.
     pub fn from_file(
         path: &Path,
         peer_id: &str,
@@ -44,21 +37,30 @@ impl FileSignature {
         })
     }
 
-    /// Formats file size into human readable string (e.g., "1.45 MB")
     #[allow(dead_code)]
     pub fn formatted_size(&self) -> String {
         format_bytes(self.file_size)
     }
 }
 
-/// Helper function to stream a file and compute its BLAKE3 hash without loading entire file into memory.
 pub fn compute_file_hash_and_meta(path: &Path) -> anyhow::Result<(String, String, u64)> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open file for signature check: {}", path.display()))?;
-    
+    let (_, blake3, file_name, file_size) = compute_file_hashes_and_meta(path)?;
+    Ok((hex(&blake3), file_name, file_size))
+}
+
+pub fn compute_file_hashes_and_meta(
+    path: &Path,
+) -> anyhow::Result<([u8; 32], [u8; 32], String, u64)> {
+    let file = File::open(path).with_context(|| {
+        format!(
+            "Failed to open file for signature check: {}",
+            path.display()
+        )
+    })?;
+
     let metadata = file.metadata()?;
     let file_size = metadata.len();
-    
+
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -66,8 +68,9 @@ pub fn compute_file_hash_and_meta(path: &Path) -> anyhow::Result<(String, String
         .to_string();
 
     let mut reader = BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 65536]; // 64 KB buffer
+    let mut blake3_hasher = blake3::Hasher::new();
+    let mut sha256_hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 65536];
 
     loop {
         let bytes_read = reader
@@ -76,11 +79,23 @@ pub fn compute_file_hash_and_meta(path: &Path) -> anyhow::Result<(String, String
         if bytes_read == 0 {
             break;
         }
-        hasher.update(&buffer[..bytes_read]);
+        blake3_hasher.update(&buffer[..bytes_read]);
+        sha256_hasher.update(&buffer[..bytes_read]);
     }
 
-    let hash_hex = hasher.finalize().to_hex().to_string();
-    Ok((hash_hex, file_name, file_size))
+    let blake3 = *blake3_hasher.finalize().as_bytes();
+    let sha256: [u8; 32] = sha256_hasher.finalize().into();
+    Ok((sha256, blake3, file_name, file_size))
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(DIGITS[(byte >> 4) as usize] as char);
+        result.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    result
 }
 
 #[allow(dead_code)]
@@ -111,13 +126,9 @@ mod tests {
         let mut temp_file = NamedTempFile::new().unwrap();
         writeln!(temp_file, "protonet-test-threat-payload").unwrap();
 
-        let sig = FileSignature::from_file(
-            temp_file.path(),
-            "Node-Test-1",
-            "Test Flag",
-            "CRITICAL",
-        )
-        .unwrap();
+        let sig =
+            FileSignature::from_file(temp_file.path(), "Node-Test-1", "Test Flag", "CRITICAL")
+                .unwrap();
 
         assert_eq!(sig.blake3_hash.len(), 64);
         assert_eq!(sig.flagged_by_peer, "Node-Test-1");

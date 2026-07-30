@@ -11,25 +11,58 @@ egui = "0.27"
 egui_extras = "0.27"
 image = { version = "0.24", default-features = false, features = ["png"] }
 tokio = { version = "1.37", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
 bytes = "1.5"
 futures = "0.3"
 blake3 = "1.5"
-chacha20poly1305 = "0.10"
-rand = "0.8"
+sha2 = "0.10"
 rfd = "0.14"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+postcard = { version = "1.1.3", features = ["alloc"] }
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.8", features = ["v4", "serde"] }
 parking_lot = "0.12"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["json"] }
+libp2p = { version = "=0.56.0", features = [
+    "tokio",
+    "quic",
+    "tcp",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "kad",
+    "mdns",
+    "identify",
+    "ping",
+    "request-response",
+    "autonat",
+    "dcutr",
+    "relay",
+    "dns",
+    "metrics",
+    "serde",
+    "macros",
+    "ed25519",
+] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+lru = "0.16"
+async-trait = "0.1"
+directories = "6"
+thiserror = "2"
+hdrhistogram = "7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 
 [profile.release]
 opt-level = 3

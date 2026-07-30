@@ -1,0 +1,81 @@
+[package]
+name = "protonet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postcard = { version = "1.1.3", features = ["alloc"] }
+libp2p = { version = "=0.56.0", features = ["serde"] }
+tempfile = "3"
+protonet = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "flagged_record_decoder"
+path = "fuzz_targets/flagged_record_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed_record_validator"
+path = "fuzz_targets/signed_record_validator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inventory_decoder"
+path = "fuzz_targets/inventory_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_request_decoder"
+path = "fuzz_targets/sync_request_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_response_decoder"
+path = "fuzz_targets/sync_response_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multiaddress_ingestion"
+path = "fuzz_targets/multiaddress_ingestion.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persistent_identity_loader"
+path = "fuzz_targets/persistent_identity_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "database_record_loader"
+path = "fuzz_targets/database_record_loader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_version_parser"
+path = "fuzz_targets/protocol_version_parser.rs"
+test = false
+doc = false
+bench = false

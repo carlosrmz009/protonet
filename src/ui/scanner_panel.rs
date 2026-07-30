@@ -1,25 +1,16 @@
 use crate::p2p::{P2pCommand, P2pHandle};
-use crate::signature::{compute_file_hash_and_meta, FileSignature, SharedSignatureDb};
+use crate::signature::{compute_file_hashes_and_meta, FileSignature, SharedSignatureDb};
 use crate::ui::theme::ThemeColors;
 use egui::{Color32, Frame, RichText, Rounding, Stroke, Vec2};
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+#[derive(Default)]
 pub struct ScannerState {
     pub last_scanned_file: Option<PathBuf>,
     pub last_action_msg: Option<String>,
     pub is_last_flagged_by_us: bool,
-}
-
-impl Default for ScannerState {
-    fn default() -> Self {
-        Self {
-            last_scanned_file: None,
-            last_action_msg: None,
-            is_last_flagged_by_us: false,
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -31,7 +22,6 @@ pub fn render_scanner_panel(
     active_threat_alert: &mut Option<FileSignature>,
 ) {
     ui.vertical(|ui| {
-        // Top Banner / Intro Card
         let banner_frame = Frame::none()
             .fill(ThemeColors::BG_ELEVATED)
             .stroke(Stroke::new(1.0_f32, ThemeColors::BORDER_MUTED))
@@ -55,11 +45,9 @@ pub fn render_scanner_panel(
 
         ui.add_space(24.0);
 
-        // Action Buttons Row
         ui.horizontal(|ui| {
             let btn_size = Vec2::new(190.0, 42.0);
 
-            // Choose File Button (Primary Action)
             let choose_btn = egui::Button::new(
                 RichText::new("📂 Choose File...")
                     .strong()
@@ -86,7 +74,6 @@ pub fn render_scanner_panel(
 
             ui.add_space(12.0);
 
-            // Sample Demo File Generator Button
             let demo_btn_size = Vec2::new(230.0, 42.0);
             let demo_btn = egui::Button::new(
                 RichText::new("🛠 Create Sample Threat File (Demo)")
@@ -106,7 +93,6 @@ pub fn render_scanner_panel(
 
         ui.add_space(30.0);
 
-        // Feedback / Action Status Display Card
         if let Some(msg) = &state.last_action_msg {
             let status_color = if state.is_last_flagged_by_us {
                 ThemeColors::ACCENT_EMERALD
@@ -150,8 +136,7 @@ pub fn handle_file_chosen(
 ) {
     state.last_scanned_file = Some(path.clone());
 
-    // Compute hash
-    let (hash_hex, file_name, _size) = match compute_file_hash_and_meta(&path) {
+    let (sha256, blake3, file_name, size) = match compute_file_hashes_and_meta(&path) {
         Ok(res) => res,
         Err(e) => {
             let msg = format!("error hashing file: {}", e);
@@ -161,38 +146,34 @@ pub fn handle_file_chosen(
             return;
         }
     };
+    let hash_hex = crate::signature::hasher::hex(&blake3);
 
     logs.push(format!("scan :: checking file '{}'", file_name));
     logs.push(format!("hash :: blake3={}", hash_hex));
 
-    // 1. Check if the signature ALREADY exists in our synchronized P2P database
     if let Some(existing_sig) = shared_db.is_flagged(&hash_hex) {
-        // BOOM! Trigger the VIBRANT RED FLAGGED ALERT SCREEN!
         *active_threat_alert = Some(existing_sig.clone());
         let msg = format!(
             "file '{}' matched FLAGGED threat signature from peer {}!",
             file_name, existing_sig.flagged_by_peer
         );
         state.last_action_msg = Some(msg.clone());
-        logs.push(format!("alert:: flagged match detected! by {}", existing_sig.flagged_by_peer));
+        logs.push(format!(
+            "alert:: flagged match detected! by {}",
+            existing_sig.flagged_by_peer
+        ));
         state.is_last_flagged_by_us = false;
     } else {
-        // 2. Not flagged yet! Generate signature, tag as FLAGGED, store in DB, and Broadcast via Gossip
-        match FileSignature::from_file(
-            &path,
-            &p2p_handle.node_id,
-            "Flagged via Protonet",
-            "HIGH",
-        ) {
-            Ok(new_sig) => {
-                shared_db.insert_and_save(new_sig.clone());
-                let _ = p2p_handle
-                    .cmd_tx
-                    .try_send(P2pCommand::BroadcastGossip(new_sig.clone()));
-
+        match p2p_handle.cmd_tx.try_send(P2pCommand::PublishFile {
+            sha256,
+            blake3,
+            file_size: size,
+            file_name: Some(file_name.clone()),
+        }) {
+            Ok(()) => {
                 let msg = format!(
                     "tagged '{}' as FLAGGED! blake3 signature broadcasted to {} peers.",
-                    new_sig.file_name,
+                    file_name,
                     p2p_handle.peer_count()
                 );
                 state.last_action_msg = Some(msg.clone());
@@ -200,7 +181,7 @@ pub fn handle_file_chosen(
                 state.is_last_flagged_by_us = true;
             }
             Err(e) => {
-                let msg = format!("failed to generate signature: {}", e);
+                let msg = format!("failed to queue signed record: {}", e);
                 state.last_action_msg = Some(msg.clone());
                 logs.push(format!("sys  :: {}", msg));
                 state.is_last_flagged_by_us = false;

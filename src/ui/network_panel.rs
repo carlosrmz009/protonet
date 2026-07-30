@@ -2,22 +2,22 @@ use crate::p2p::{P2pCommand, P2pHandle};
 use crate::signature::SharedSignatureDb;
 use crate::ui::theme::ThemeColors;
 use egui::{Color32, Frame, RichText, Rounding, Stroke};
-use std::net::SocketAddr;
+const MAX_GOSSIP_LOGS: usize = 5_000;
 
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct NetworkState {
     pub remote_peer_input: String,
     pub connect_error: Option<String>,
     pub gossip_logs: Vec<String>,
 }
 
-impl Default for NetworkState {
-    fn default() -> Self {
-        Self {
-            remote_peer_input: String::new(),
-            connect_error: None,
-            gossip_logs: Vec::new(),
+impl NetworkState {
+    pub fn push_log(&mut self, message: String) {
+        if self.gossip_logs.len() >= MAX_GOSSIP_LOGS {
+            self.gossip_logs.remove(0);
         }
+        self.gossip_logs.push(message);
     }
 }
 
@@ -29,7 +29,6 @@ pub fn render_network_panel(
     state: &mut NetworkState,
 ) {
     ui.vertical(|ui| {
-        // 1. Top WAN / Remote Peer Connection Bar
         let connect_frame = Frame::none()
             .fill(ThemeColors::BG_CARD)
             .stroke(Stroke::new(1.0_f32, ThemeColors::BORDER_MUTED))
@@ -56,14 +55,14 @@ pub fn render_network_panel(
                     .button(RichText::new("Connect Peer").strong().size(13.0))
                     .clicked()
                 {
-                    match state.remote_peer_input.trim().parse::<SocketAddr>() {
+                    match state.remote_peer_input.trim().parse::<libp2p::Multiaddr>() {
                         Ok(addr) => {
-                            let _ = p2p_handle.cmd_tx.try_send(P2pCommand::ConnectRemote(addr));
+                            let _ = p2p_handle.cmd_tx.try_send(P2pCommand::Connect(addr));
                             state.connect_error = None;
                         }
                         Err(_) => {
                             state.connect_error =
-                                Some("Invalid SocketAddr format. Example: 127.0.0.1:7778".to_string());
+                                Some("Invalid multiaddress. Example: /ip4/127.0.0.1/udp/4001/quic-v1/p2p/<peer-id>".to_string());
                         }
                     }
                 }
@@ -74,7 +73,7 @@ pub fn render_network_panel(
                     .button(RichText::new("⚡ Force Sync DB").size(13.0))
                     .clicked()
                 {
-                    let _ = p2p_handle.cmd_tx.try_send(P2pCommand::RequestSync);
+                    let _ = p2p_handle.cmd_tx.try_send(P2pCommand::RequestSyncAny);
                 }
             });
 
@@ -90,9 +89,7 @@ pub fn render_network_panel(
 
         ui.add_space(20.0);
 
-        // 2. Split view: Connected Peers Table (Left) & Active Flagged Signatures Ledger (Right)
         ui.columns(2, |cols| {
-            // Left column: Connected Peers
             cols[0].vertical(|ui| {
                 let frame = Frame::none()
                     .fill(ThemeColors::BG_CARD)
@@ -124,7 +121,7 @@ pub fn render_network_panel(
                                 .color(ThemeColors::TEXT_MUTED),
                         );
                     } else {
-                        for (addr, node_id) in peers {
+                        for peer in peers {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new("🟢")
@@ -132,13 +129,13 @@ pub fn render_network_panel(
                                         .color(ThemeColors::ACCENT_EMERALD),
                                 );
                                 ui.label(
-                                    RichText::new(format!("{:<15}", node_id))
+                                    RichText::new(peer.peer_id.to_string())
                                         .strong()
                                         .size(13.0)
                                         .color(Color32::WHITE),
                                 );
                                 ui.label(
-                                    RichText::new(addr.to_string())
+                                    RichText::new(format!("{} · {:?} · {:?}", peer.address, peer.directness, peer.transport))
                                         .monospace()
                                         .size(12.0)
                                         .color(ThemeColors::TEXT_MUTED),
@@ -150,7 +147,6 @@ pub fn render_network_panel(
                 });
             });
 
-            // Right column: Synced Signatures Ledger
             cols[1].vertical(|ui| {
                 let frame = Frame::none()
                     .fill(ThemeColors::BG_CARD)
@@ -232,7 +228,6 @@ pub fn render_network_panel(
 
         ui.add_space(20.0);
 
-        // 3. Real-Time P2P Gossip Event Log
         let log_frame = Frame::none()
             .fill(ThemeColors::BG_CARD)
             .stroke(Stroke::new(1.0_f32, ThemeColors::BORDER_MUTED))
