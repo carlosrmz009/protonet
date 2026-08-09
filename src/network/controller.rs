@@ -1,5 +1,5 @@
 use crate::network::connection_manager::{Directness, TransportKind};
-use crate::network::limits::{MAX_NETWORK_COMMANDS, MAX_UI_EVENTS};
+use crate::network::limits::MAX_NETWORK_COMMANDS;
 use crate::network::metrics::MetricsSnapshot;
 use crate::protocol::RecordId;
 use crate::storage::SharedSignatureDb;

@@ -1,7 +1,6 @@
 use crate::protocol::sync::{SyncRequest, SyncResponse, MAX_SYNC_FRAME_BYTES};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
-use std::future::Future;
 use std::io;
 
 #[derive(Debug, Clone, Default)]
@@ -12,50 +11,50 @@ impl request_response::Codec for SyncCodec {
     type Request = SyncRequest;
     type Response = SyncResponse;
 
-    fn read_request<T>(
+    async fn read_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = io::Result<Self::Request>> + Send
+    ) -> io::Result<Self::Request>
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_bounded(io)
+        decode_bounded(io).await
     }
 
-    fn read_response<T>(
+    async fn read_response<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
-    ) -> impl Future<Output = io::Result<Self::Response>> + Send
+    ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_bounded(io)
+        decode_bounded(io).await
     }
 
-    fn write_request<T>(
+    async fn write_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
         request: Self::Request,
-    ) -> impl Future<Output = io::Result<()>> + Send
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move { encode_bounded(io, &request).await }
+        encode_bounded(io, &request).await
     }
 
-    fn write_response<T>(
+    async fn write_response<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
-    ) -> impl Future<Output = io::Result<()>> + Send
+    ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        async move { encode_bounded(io, &response).await }
+        encode_bounded(io, &response).await
     }
 }
 

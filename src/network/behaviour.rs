@@ -66,11 +66,13 @@ impl ProtonetBehaviour {
         .map_err(|error| anyhow::anyhow!(error))?;
         if enable_peer_scoring {
             let mut score = gossipsub::PeerScoreParams::default();
-            let mut topic_score = gossipsub::TopicScoreParams::default();
-            topic_score.mesh_message_deliveries_weight = -1.0;
-            topic_score.mesh_message_deliveries_window = Duration::from_secs(60);
-            topic_score.mesh_message_deliveries_activation = Duration::from_secs(30);
-            topic_score.mesh_message_deliveries_cap = 100.0;
+            let topic_score = gossipsub::TopicScoreParams {
+                mesh_message_deliveries_weight: -1.0,
+                mesh_message_deliveries_window: Duration::from_secs(60),
+                mesh_message_deliveries_activation: Duration::from_secs(30),
+                mesh_message_deliveries_cap: 100.0,
+                ..Default::default()
+            };
             score.topics.insert(topic.hash(), topic_score);
             gossipsub
                 .with_peer_score(score, gossipsub::PeerScoreThresholds::default())
