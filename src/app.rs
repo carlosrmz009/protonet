@@ -147,7 +147,8 @@ impl ProtonetApp {
                     self.network_state.push_log(format!("log  :: {}", msg));
                 }
                 P2pEvent::RelayReservation { relay_peer_id } => {
-                    self.network_state.push_log(format!("relay:: reservation active via {}", relay_peer_id));
+                    self.network_state
+                        .push_log(format!("relay:: reservation active via {}", relay_peer_id));
                 }
             }
         }

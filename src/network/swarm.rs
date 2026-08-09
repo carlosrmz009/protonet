@@ -23,9 +23,9 @@ use crate::storage::{
 };
 use futures::StreamExt;
 use libp2p::{
-    autonat, gossipsub, identify, kad, mdns, relay,
+    autonat, gossipsub, identify, kad, mdns,
     multiaddr::Protocol,
-    ping, request_response,
+    ping, relay, request_response,
     swarm::{Swarm, SwarmEvent},
     Multiaddr, PeerId, SwarmBuilder,
 };
@@ -687,7 +687,12 @@ impl Actor<'_> {
             SwarmEvent::NewListenAddr { address, .. } => {
                 if !self.listen_addresses.contains(&address) {
                     self.listen_addresses.push(address.clone());
-                    try_event(self.event_tx, NetworkEvent::Listening { address: address.clone() });
+                    try_event(
+                        self.event_tx,
+                        NetworkEvent::Listening {
+                            address: address.clone(),
+                        },
+                    );
                 }
                 if self.allow_private_test_network {
                     self.swarm.add_external_address(address);

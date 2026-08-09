@@ -214,7 +214,10 @@ async fn relay_only_peers_establish_end_to_end_encrypted_circuit() {
     let first_id = first.handle.local_peer_id().unwrap();
     let second_id = second.handle.local_peer_id().unwrap();
     println!("Relay test: Relay is {:?} at {}", relay_id, relay_address);
-    println!("Relay test: First is {:?}, Second is {:?}", first_id, second_id);
+    println!(
+        "Relay test: First is {:?}, Second is {:?}",
+        first_id, second_id
+    );
     wait_relay_reservation(&mut first, relay_id).await;
     wait_relay_reservation(&mut second, relay_id).await;
     let mut second_circuit = relay_address;
