@@ -2,6 +2,7 @@
 
 use libp2p::{multiaddr::Protocol, Multiaddr, PeerId};
 use protonet::network::{NetworkCommand, NetworkConfig, NetworkEvent, P2pEngine, P2pHandle};
+use protonet::protocol::{record::unix_time_ms, FlaggedFileRecord};
 use protonet::storage::SharedSignatureDb;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -34,14 +35,32 @@ async fn start_custom_node(
     relay_addresses: Vec<Multiaddr>,
     enable_relay_server: bool,
 ) -> Node {
+    start_custom_node_with_response_delay(
+        listen_addresses,
+        relay_addresses,
+        enable_relay_server,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn start_custom_node_with_response_delay(
+    listen_addresses: Vec<Multiaddr>,
+    relay_addresses: Vec<Multiaddr>,
+    enable_relay_server: bool,
+    sync_records_response_delay: Duration,
+) -> Node {
     let root = tempfile::tempdir().unwrap();
     let database = SharedSignatureDb::try_new(root.path().join("records.sqlite3")).unwrap();
+    let allow_private_test_network = !relay_addresses.is_empty() || enable_relay_server;
     let config = NetworkConfig {
         listen_addresses,
         bootstrap_peers: Vec::new(),
         relay_addresses,
         enable_mdns: false,
         enable_relay_server,
+        allow_private_test_network,
+        sync_records_response_delay,
         sync_interval: Duration::from_secs(60),
         database_path: root.path().join("records.sqlite3"),
         identity_path: root.path().join("identity.dat"),
@@ -79,6 +98,8 @@ async fn start_discovery_node(bootstrap_peers: Vec<Multiaddr>, enable_mdns: bool
         relay_addresses: Vec::new(),
         enable_mdns,
         enable_relay_server: false,
+        allow_private_test_network: true,
+        sync_records_response_delay: Duration::ZERO,
         sync_interval: Duration::from_secs(60),
         database_path: root.path().join("records.sqlite3"),
         identity_path: root.path().join("identity.dat"),
@@ -121,6 +142,23 @@ async fn wait_connected(node: &mut Node, expected: PeerId) {
     })
     .await
     .expect("authenticated connection was not established");
+}
+
+async fn wait_relay_reservation(node: &mut Node, expected: PeerId) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(event) = node.events.recv().await {
+                println!("Relay test event: {:?}", event);
+                if let NetworkEvent::RelayReservation { relay_peer_id } = event {
+                    if relay_peer_id == expected {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("relay reservation was not accepted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -172,24 +210,16 @@ async fn relay_only_peers_establish_end_to_end_encrypted_circuit() {
     relay_address.push(Protocol::P2p(relay_id));
 
     let mut first = start_custom_node(Vec::new(), vec![relay_address.clone()], false).await;
-    let mut second = start_custom_node(Vec::new(), vec![relay_address], false).await;
+    let mut second = start_custom_node(Vec::new(), vec![relay_address.clone()], false).await;
     let first_id = first.handle.local_peer_id().unwrap();
     let second_id = second.handle.local_peer_id().unwrap();
-
-    let mut second_circuit = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(NetworkEvent::Listening { address }) = second.events.recv().await {
-                if address.to_string().contains("/p2p-circuit") {
-                    return address;
-                }
-            }
-        }
-    })
-    .await
-    .expect("relay reservation did not produce a circuit address");
-    if !matches!(second_circuit.iter().last(), Some(Protocol::P2p(peer)) if peer == second_id) {
-        second_circuit.push(Protocol::P2p(second_id));
-    }
+    println!("Relay test: Relay is {:?} at {}", relay_id, relay_address);
+    println!("Relay test: First is {:?}, Second is {:?}", first_id, second_id);
+    wait_relay_reservation(&mut first, relay_id).await;
+    wait_relay_reservation(&mut second, relay_id).await;
+    let mut second_circuit = relay_address;
+    second_circuit.push(Protocol::P2pCircuit);
+    second_circuit.push(Protocol::P2p(second_id));
     first
         .handle
         .cmd_tx
@@ -408,4 +438,130 @@ async fn quic_peers_propagate_and_partition_recovery_syncs_without_central_servi
 
     let _ = first.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
     let _ = second.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ten_day_multi_bucket_sync_converges_with_forced_response_reordering() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let mut first = start_custom_node_with_response_delay(
+        vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+            "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        ],
+        Vec::new(),
+        false,
+        Duration::from_millis(250),
+    )
+    .await;
+    let mut second = start_node().await;
+    let first_id = first.handle.local_peer_id().unwrap();
+    let key = libp2p::identity::Keypair::generate_ed25519();
+    let now = unix_time_ms();
+    for day in 0..10_i64 {
+        let created = now - day * 86_400_000;
+        for item in 0..3_u64 {
+            let sequence = (day as u64) * 3 + item + 1;
+            let record = FlaggedFileRecord::create(
+                &key,
+                sequence,
+                created,
+                [sequence as u8; 32],
+                [(sequence + 64) as u8; 32],
+                10,
+                None,
+            )
+            .unwrap();
+            first.database.insert_record(&record).unwrap();
+        }
+    }
+    let mut address = quic_listen(&mut first).await;
+    let _ = quic_listen(&mut second).await;
+    address.push(Protocol::P2p(first_id));
+    second
+        .handle
+        .cmd_tx
+        .send(NetworkCommand::Connect(address))
+        .await
+        .unwrap();
+    wait_connected(&mut second, first_id).await;
+    second
+        .handle
+        .cmd_tx
+        .send(NetworkCommand::RequestSync(first_id))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while second.database.count() != 30 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("multi-bucket synchronization did not converge");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if second.handle.snapshot().metrics.sync_response_reorders > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("delayed records did not force out-of-order synchronization responses");
+    let _ = first.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
+    let _ = second.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn eight_real_swarms_converge_under_connection_and_sync_load() {
+    let _guard = INTEGRATION_LOCK.lock().await;
+    let mut hub = start_node().await;
+    let hub_id = hub.handle.local_peer_id().unwrap();
+    let mut hub_address = quic_listen(&mut hub).await;
+    hub_address.push(Protocol::P2p(hub_id));
+    let mut nodes = Vec::new();
+    for _ in 0..7 {
+        let mut node = start_node().await;
+        let _ = quic_listen(&mut node).await;
+        let node_id = node.handle.local_peer_id().unwrap();
+        node.handle
+            .cmd_tx
+            .send(NetworkCommand::Connect(hub_address.clone()))
+            .await
+            .unwrap();
+        wait_connected(&mut node, hub_id).await;
+        wait_connected(&mut hub, node_id).await;
+        nodes.push(node);
+    }
+    hub.handle
+        .cmd_tx
+        .send(NetworkCommand::PublishFile {
+            sha256: [81; 32],
+            blake3: [82; 32],
+            file_size: 8_192,
+            file_name: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for node in &nodes {
+        node.handle
+            .cmd_tx
+            .send(NetworkCommand::RequestSync(hub_id))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if hub.database.count() == 1 && nodes.iter().all(|node| node.database.count() == 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("real multi-swarm convergence failed");
+    let _ = hub.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
+    for node in nodes {
+        let _ = node.handle.cmd_tx.send(NetworkCommand::Shutdown).await;
+    }
 }

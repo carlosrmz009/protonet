@@ -1,3 +1,4 @@
+use crate::network::limits::{MAX_CONNECTIONS_PER_IP_PREFIX, MAX_RELAY_ONLY_CONNECTIONS};
 use libp2p::{core::ConnectedPoint, Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -45,6 +46,32 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
+    pub fn can_accept(&self, endpoint: &ConnectedPoint) -> bool {
+        let address = match endpoint {
+            ConnectedPoint::Dialer { address, .. } => address,
+            ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+        };
+        let (_, directness) = classify_address(address);
+        if directness == Directness::Relayed
+            && self
+                .peers
+                .values()
+                .filter(|state| state.directness == Directness::Relayed)
+                .count()
+                >= MAX_RELAY_ONLY_CONNECTIONS
+        {
+            return false;
+        }
+        let Some(prefix) = address_prefix(address) else {
+            return directness == Directness::Relayed;
+        };
+        self.peers
+            .values()
+            .filter(|state| address_prefix(&state.address).as_deref() == Some(prefix.as_str()))
+            .count()
+            < MAX_CONNECTIONS_PER_IP_PREFIX
+    }
+
     pub fn connected(&mut self, peer: PeerId, endpoint: &ConnectedPoint, now: Instant) {
         let (direction, address) = match endpoint {
             ConnectedPoint::Dialer { address, .. } => {
@@ -115,6 +142,11 @@ impl ConnectionManager {
         self.peers.len()
     }
 
+    pub fn source_keys(&self, peer: &PeerId) -> Option<(String, String)> {
+        let address = &self.peers.get(peer)?.address;
+        Some((address_ip(address)?, address_prefix(address)?))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
@@ -129,6 +161,31 @@ impl ConnectionManager {
             .map(|state| state.peer_id)
             .collect()
     }
+}
+
+fn address_ip(address: &Multiaddr) -> Option<String> {
+    address.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(ip.to_string()),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(ip.to_string()),
+        _ => None,
+    })
+}
+
+fn address_prefix(address: &Multiaddr) -> Option<String> {
+    address.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::Ip4(ip) => {
+            let octets = ip.octets();
+            Some(format!("v4-{}.{}.{}", octets[0], octets[1], octets[2]))
+        }
+        libp2p::multiaddr::Protocol::Ip6(ip) => {
+            let segments = ip.segments();
+            Some(format!(
+                "v6-{:x}:{:x}:{:x}:{:x}",
+                segments[0], segments[1], segments[2], segments[3]
+            ))
+        }
+        _ => None,
+    })
 }
 
 pub fn classify_address(address: &Multiaddr) -> (TransportKind, Directness) {

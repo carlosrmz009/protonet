@@ -1,58 +1,61 @@
 use crate::protocol::sync::{SyncRequest, SyncResponse, MAX_SYNC_FRAME_BYTES};
-use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
+use std::future::Future;
 use std::io;
 
 #[derive(Debug, Clone, Default)]
 pub struct SyncCodec;
 
-#[async_trait]
 impl request_response::Codec for SyncCodec {
     type Protocol = libp2p::StreamProtocol;
     type Request = SyncRequest;
     type Response = SyncResponse;
 
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where
-        T: AsyncRead + Unpin + Send,
-    {
-        decode_bounded(io).await
-    }
-
-    async fn read_response<T>(
+    fn read_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
-    ) -> io::Result<Self::Response>
+    ) -> impl Future<Output = io::Result<Self::Request>> + Send
     where
         T: AsyncRead + Unpin + Send,
     {
-        decode_bounded(io).await
+        decode_bounded(io)
     }
 
-    async fn write_request<T>(
+    fn read_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+    ) -> impl Future<Output = io::Result<Self::Response>> + Send
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        decode_bounded(io)
+    }
+
+    fn write_request<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
         request: Self::Request,
-    ) -> io::Result<()>
+    ) -> impl Future<Output = io::Result<()>> + Send
     where
         T: AsyncWrite + Unpin + Send,
     {
-        encode_bounded(io, &request).await
+        async move { encode_bounded(io, &request).await }
     }
 
-    async fn write_response<T>(
+    fn write_response<T>(
         &mut self,
         _: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
-    ) -> io::Result<()>
+    ) -> impl Future<Output = io::Result<()>> + Send
     where
         T: AsyncWrite + Unpin + Send,
     {
-        encode_bounded(io, &response).await
+        async move { encode_bounded(io, &response).await }
     }
 }
 

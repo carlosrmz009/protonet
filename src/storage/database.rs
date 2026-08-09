@@ -1,3 +1,6 @@
+use crate::network::limits::{
+    MAX_ACTIVE_RECORDS, MAX_DAILY_NEW_RECORDS, MAX_DATABASE_BYTES, MIN_FREE_DISK_BYTES,
+};
 use crate::protocol::record::{unix_time_ms, ThreatLevel};
 use crate::protocol::sync::{
     MAX_BUCKETS, MAX_IDS_PER_RESPONSE, MAX_RECORDS_PER_RESPONSE, MAX_REQUESTED_RECORDS,
@@ -60,6 +63,13 @@ impl SharedSignatureDb {
         self.inner.lock().get_all().unwrap_or_default()
     }
 
+    pub fn get_signatures_page(&self, offset: usize, limit: usize) -> Vec<FileSignature> {
+        self.inner
+            .lock()
+            .get_page(offset, limit.min(100))
+            .unwrap_or_default()
+    }
+
     pub fn count(&self) -> usize {
         self.inner.lock().count().unwrap_or(0)
     }
@@ -109,10 +119,29 @@ impl SharedSignatureDb {
     }
 
     pub fn database_size_bytes(&self) -> u64 {
-        std::fs::metadata(self.inner.lock().path())
-            .map(|m| m.len())
-            .unwrap_or(0)
+        total_database_size(self.inner.lock().path())
     }
+
+    pub fn origin_highest_sequences(&self) -> anyhow::Result<Vec<(libp2p::PeerId, u64)>> {
+        self.inner.lock().origin_highest_sequences()
+    }
+
+    pub fn active_record_ids(&self, now_ms: i64) -> anyhow::Result<Vec<RecordId>> {
+        self.inner.lock().active_record_ids(now_ms)
+    }
+
+    pub fn storage_safety_status(&self) -> anyhow::Result<StorageSafetyStatus> {
+        self.inner.lock().storage_safety_status()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageSafetyStatus {
+    pub safe: bool,
+    pub reason: Option<String>,
+    pub database_size_bytes: u64,
+    pub active_records: usize,
+    pub available_disk_bytes: u64,
 }
 
 impl SignatureDatabase {
@@ -121,6 +150,12 @@ impl SignatureDatabase {
             std::fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(&path)?;
+        let auto_vacuum: i64 = connection.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+        if auto_vacuum != 2 {
+            connection.execute_batch(
+                "PRAGMA journal_mode = DELETE; PRAGMA auto_vacuum = INCREMENTAL; VACUUM;",
+            )?;
+        }
         connection.execute_batch(crate::storage::migrations::SCHEMA)?;
         Ok(Self { connection, path })
     }
@@ -139,26 +174,33 @@ impl SignatureDatabase {
     }
 
     pub fn insert_record(&mut self, record: &FlaggedFileRecord) -> anyhow::Result<bool> {
-        let tx = self.connection.transaction()?;
-        let inserted = insert_one(&tx, record)?;
-        if inserted {
-            increment_generation(&tx)?;
-        }
-        tx.commit()?;
-        Ok(inserted)
+        Ok(self
+            .insert_batch(std::slice::from_ref(record))?
+            .into_iter()
+            .next()
+            .unwrap_or(false))
     }
 
     pub fn insert_batch(&mut self, records: &[FlaggedFileRecord]) -> anyhow::Result<Vec<bool>> {
+        self.ensure_capacity(records)?;
         let tx = self.connection.transaction()?;
         let mut results = Vec::with_capacity(records.len());
         let mut changed = false;
+        let mut inserted_count = 0_u64;
         for record in records.iter().take(100) {
             let inserted = insert_one(&tx, record)?;
             changed |= inserted;
+            inserted_count = inserted_count.saturating_add(u64::from(inserted));
             results.push(inserted);
         }
         if changed {
             increment_generation(&tx)?;
+            let day = unix_time_ms().div_euclid(DAY_MS);
+            tx.execute(
+                "INSERT INTO ingestion_daily(day, record_count) VALUES (?1, ?2)
+                 ON CONFLICT(day) DO UPDATE SET record_count = record_count + excluded.record_count",
+                params![day, i64::try_from(inserted_count)?],
+            )?;
         }
         tx.commit()?;
         Ok(results)
@@ -202,10 +244,36 @@ impl SignatureDatabase {
         Ok(result)
     }
 
+    pub fn get_page(&self, offset: usize, limit: usize) -> anyhow::Result<Vec<FileSignature>> {
+        let mut statement = self.connection.prepare(
+            "SELECT encoded_record FROM records ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = statement.query_map(
+            params![i64::try_from(limit)?, i64::try_from(offset)?],
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let mut result = Vec::with_capacity(limit);
+        for row in rows {
+            if let Ok(record) = decode_record(&row?) {
+                result.push(to_file_signature(record));
+            }
+        }
+        Ok(result)
+    }
+
     pub fn count(&self) -> anyhow::Result<usize> {
         let count: i64 = self
             .connection
             .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
+    }
+
+    fn active_count(&self, now_ms: i64) -> anyhow::Result<usize> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM records WHERE expires_at > ?1",
+            [now_ms],
+            |row| row.get(0),
+        )?;
         Ok(count.max(0) as usize)
     }
 
@@ -375,8 +443,135 @@ impl SignatureDatabase {
         }
         tx.commit()?;
         self.connection
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum(2048);")?;
+        self.connection.execute(
+            "DELETE FROM ingestion_daily WHERE day < ?1",
+            [now_ms.div_euclid(DAY_MS).saturating_sub(31)],
+        )?;
         Ok(changed)
+    }
+
+    pub fn storage_safety_status(&self) -> anyhow::Result<StorageSafetyStatus> {
+        let database_size_bytes = total_database_size(&self.path);
+        let active_records = self.active_count(unix_time_ms())?;
+        let available_disk_bytes = available_disk_bytes(&self.path);
+        let reason = if database_size_bytes >= MAX_DATABASE_BYTES {
+            Some("database byte limit reached".to_owned())
+        } else if active_records >= MAX_ACTIVE_RECORDS {
+            Some("active record limit reached".to_owned())
+        } else if available_disk_bytes < MIN_FREE_DISK_BYTES {
+            Some("free disk reserve reached".to_owned())
+        } else {
+            None
+        };
+        Ok(StorageSafetyStatus {
+            safe: reason.is_none(),
+            reason,
+            database_size_bytes,
+            active_records,
+            available_disk_bytes,
+        })
+    }
+
+    pub fn origin_highest_sequences(&self) -> anyhow::Result<Vec<(libp2p::PeerId, u64)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT origin_peer_id, highest_sequence FROM origin_sequences LIMIT ?1")?;
+        let rows = statement.query_map([i64::try_from(MAX_ACTIVE_RECORDS)?], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            let (peer, sequence) = row?;
+            if let (Ok(peer), Ok(sequence)) =
+                (libp2p::PeerId::from_bytes(&peer), u64::try_from(sequence))
+            {
+                values.push((peer, sequence));
+            }
+        }
+        Ok(values)
+    }
+
+    pub fn active_record_ids(&self, now_ms: i64) -> anyhow::Result<Vec<RecordId>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record_id FROM records WHERE expires_at > ?1 LIMIT ?2")?;
+        let rows = statement
+            .query_map(params![now_ms, i64::try_from(MAX_ACTIVE_RECORDS)?], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+        let mut values = Vec::new();
+        for row in rows {
+            if let Ok(id) = <[u8; 32]>::try_from(row?.as_slice()) {
+                values.push(id);
+            }
+        }
+        Ok(values)
+    }
+
+    fn ensure_capacity(&self, records: &[FlaggedFileRecord]) -> anyhow::Result<()> {
+        self.ensure_capacity_with_limits(
+            records,
+            MAX_ACTIVE_RECORDS,
+            MAX_DATABASE_BYTES,
+            MIN_FREE_DISK_BYTES,
+            MAX_DAILY_NEW_RECORDS,
+        )
+    }
+
+    fn ensure_capacity_with_limits(
+        &self,
+        records: &[FlaggedFileRecord],
+        max_active_records: usize,
+        max_database_bytes: u64,
+        min_free_disk_bytes: u64,
+        max_daily_records: u64,
+    ) -> anyhow::Result<()> {
+        if self.path == Path::new(":memory:") {
+            return Ok(());
+        }
+        let database_size_bytes = total_database_size(&self.path);
+        let active_records = self.active_count(unix_time_ms())?;
+        let available_disk_bytes = available_disk_bytes(&self.path);
+        let projected_records = records.len().min(100);
+        if active_records.saturating_add(projected_records) > max_active_records {
+            bail!("storage safety mode: active record limit would be exceeded");
+        }
+        let projected_bytes = records
+            .iter()
+            .take(100)
+            .map(|record| {
+                record
+                    .encode()
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(u64::MAX)
+            })
+            .try_fold(0_u64, u64::checked_add)
+            .context("storage projection overflow")?;
+        if database_size_bytes.saturating_add(projected_bytes) > max_database_bytes {
+            bail!("storage safety mode: database byte limit would be exceeded");
+        }
+        if available_disk_bytes < min_free_disk_bytes.saturating_add(projected_bytes) {
+            bail!("storage safety mode: free disk reserve would be exceeded");
+        }
+        let day = unix_time_ms().div_euclid(DAY_MS);
+        let today: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(record_count, 0) FROM ingestion_daily WHERE day = ?1",
+                [day],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if u64::try_from(today.max(0))
+            .unwrap_or(u64::MAX)
+            .saturating_add(projected_records as u64)
+            > max_daily_records
+        {
+            bail!("storage safety mode: daily growth limit would be exceeded");
+        }
+        Ok(())
     }
 
     pub fn recent_replay_seeds(
@@ -411,6 +606,51 @@ impl SignatureDatabase {
         }
         Ok(seeds)
     }
+}
+
+fn total_database_size(path: &Path) -> u64 {
+    if path == Path::new(":memory:") {
+        return 0;
+    }
+    let base = path.to_string_lossy();
+    [
+        base.to_string(),
+        format!("{base}-wal"),
+        format!("{base}-shm"),
+    ]
+    .iter()
+    .filter_map(|item| std::fs::metadata(item).ok())
+    .fold(0_u64, |total, metadata| {
+        total.saturating_add(metadata.len())
+    })
+}
+
+#[cfg(windows)]
+fn available_disk_bytes(path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let target = path.parent().unwrap_or(path);
+    let wide: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0_u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        0
+    } else {
+        available
+    }
+}
+
+#[cfg(not(windows))]
+fn available_disk_bytes(_: &Path) -> u64 {
+    u64::MAX
 }
 
 fn insert_one(tx: &Transaction<'_>, record: &FlaggedFileRecord) -> anyhow::Result<bool> {
@@ -583,5 +823,50 @@ mod tests {
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].0, record.record_id);
         assert_eq!(seeds[0].2, record.sequence);
+    }
+
+    #[test]
+    fn storage_limits_reject_record_count_bytes_low_disk_and_daily_growth() {
+        let root = tempfile::tempdir().unwrap();
+        let database = SignatureDatabase::open(root.path().join("limits.db")).unwrap();
+        let key = identity::Keypair::generate_ed25519();
+        let item = record(&key, 1, unix_time_ms());
+        let large = usize::MAX;
+        assert!(database
+            .ensure_capacity_with_limits(std::slice::from_ref(&item), 0, u64::MAX, 0, u64::MAX)
+            .unwrap_err()
+            .to_string()
+            .contains("active record"));
+        assert!(database
+            .ensure_capacity_with_limits(std::slice::from_ref(&item), large, 0, 0, u64::MAX)
+            .unwrap_err()
+            .to_string()
+            .contains("database byte"));
+        assert!(database
+            .ensure_capacity_with_limits(
+                std::slice::from_ref(&item),
+                large,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("free disk"));
+        assert!(database
+            .ensure_capacity_with_limits(&[item], large, u64::MAX, 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("daily growth"));
+    }
+
+    #[test]
+    fn database_size_includes_wal_and_shared_memory_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("size.db");
+        std::fs::write(&path, [0; 3]).unwrap();
+        std::fs::write(format!("{}-wal", path.display()), [0; 5]).unwrap();
+        std::fs::write(format!("{}-shm", path.display()), [0; 7]).unwrap();
+        assert_eq!(total_database_size(&path), 15);
     }
 }

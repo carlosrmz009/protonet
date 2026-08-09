@@ -12,6 +12,8 @@ pub struct NetworkConfig {
     pub relay_addresses: Vec<Multiaddr>,
     pub enable_mdns: bool,
     pub enable_relay_server: bool,
+    pub allow_private_test_network: bool,
+    pub sync_records_response_delay: Duration,
     pub sync_interval: Duration,
     pub database_path: PathBuf,
     pub identity_path: PathBuf,
@@ -34,6 +36,8 @@ impl NetworkConfig {
             enable_mdns: mdns_allowed_for_current_profile(),
             enable_relay_server: std::env::var("PROTONET_RELAY_SERVER")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            allow_private_test_network: false,
+            sync_records_response_delay: Duration::ZERO,
             sync_interval: Duration::from_secs(5 * 60),
             database_path: data.join("records.sqlite3"),
             identity_path: data.join("identity.dat"),

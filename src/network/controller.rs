@@ -47,6 +47,9 @@ pub enum NetworkEvent {
     PeerDisconnected {
         peer_id: PeerId,
     },
+    RelayReservation {
+        relay_peer_id: PeerId,
+    },
     RecordReceived {
         record_id: RecordId,
         from: PeerId,
@@ -73,6 +76,10 @@ pub enum NetworkEvent {
     },
     ReachabilityChanged {
         state: Reachability,
+    },
+    StorageSafetyChanged {
+        active: bool,
+        reason: Option<String>,
     },
     LogMessage(String),
 }
@@ -110,6 +117,8 @@ pub struct NetworkSnapshot {
     pub replay_cache_size: usize,
     pub database_size_bytes: u64,
     pub database_records: usize,
+    pub storage_safety_mode: bool,
+    pub storage_safety_reason: Option<String>,
     pub metrics: MetricsSnapshot,
 }
 
@@ -182,6 +191,6 @@ impl P2pEngine {
     }
 
     pub fn event_channel() -> (mpsc::Sender<NetworkEvent>, mpsc::Receiver<NetworkEvent>) {
-        mpsc::channel(MAX_UI_EVENTS)
+        mpsc::channel(1024)
     }
 }

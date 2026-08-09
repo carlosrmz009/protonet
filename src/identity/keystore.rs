@@ -68,18 +68,24 @@ impl IdentityStore {
     }
 
     fn generate_and_store(&self) -> anyhow::Result<StoredIdentity> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _lock = CreationLock::acquire(&self.path)?;
+        if self.path.exists() {
+            return self.load();
+        }
         let keypair = identity::Keypair::generate_ed25519();
         let plaintext = keypair
             .to_protobuf_encoding()
             .context("failed to serialize Ed25519 identity")?;
         let protected = protect(&plaintext).context("Windows DPAPI identity encryption failed")?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let mut bytes = Vec::with_capacity(FILE_MAGIC.len() + protected.len());
         bytes.extend_from_slice(FILE_MAGIC);
         bytes.extend_from_slice(&protected);
-        atomic_create(&self.path, &bytes)?;
+        if !atomic_create(&self.path, &bytes)? {
+            return self.load();
+        }
         let peer_id = PeerId::from_public_key(&keypair.public());
         Ok(StoredIdentity {
             keypair,
@@ -89,7 +95,52 @@ impl IdentityStore {
     }
 }
 
-fn atomic_create(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+struct CreationLock {
+    path: PathBuf,
+}
+
+impl CreationLock {
+    fn acquire(identity_path: &Path) -> anyhow::Result<Self> {
+        let parent = identity_path
+            .parent()
+            .context("identity path has no parent")?;
+        let name = identity_path
+            .file_name()
+            .context("identity path has no file name")?
+            .to_string_lossy();
+        let path = parent.join(format!(".{name}.lock"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    writeln!(file, "{}", std::process::id())?;
+                    file.sync_all()?;
+                    return Ok(Self { path });
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    if std::time::Instant::now() >= deadline {
+                        bail!("timed out waiting for identity creation lock");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for CreationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn atomic_create(path: &Path, bytes: &[u8]) -> anyhow::Result<bool> {
     let parent = path.parent().context("identity path has no parent")?;
     let temp_path = parent.join(format!(
         ".identity-{}-{}.tmp",
@@ -104,10 +155,10 @@ fn atomic_create(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     file.sync_all()?;
     drop(file);
     match fs::rename(&temp_path, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(_error) if path.exists() => {
             let _ = fs::remove_file(&temp_path);
-            Ok(())
+            Ok(false)
         }
         Err(error) => {
             let _ = fs::remove_file(&temp_path);
@@ -249,5 +300,27 @@ mod tests {
         let path = root.path().join("identity.dat");
         fs::write(&path, b"not an identity").unwrap();
         assert!(IdentityStore::new(path).load().is_err());
+    }
+
+    #[test]
+    fn concurrent_creation_uses_the_persisted_winner() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("identity.dat");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                IdentityStore::new(path).load_or_create().unwrap().peer_id
+            }));
+        }
+        let peers: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(peers.iter().all(|peer| peer == &peers[0]));
+        assert_eq!(IdentityStore::new(path).load().unwrap().peer_id, peers[0]);
     }
 }

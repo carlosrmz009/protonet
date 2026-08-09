@@ -5,6 +5,10 @@ use sha2::Digest;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FileSignature {
@@ -51,6 +55,18 @@ pub fn compute_file_hash_and_meta(path: &Path) -> anyhow::Result<(String, String
 pub fn compute_file_hashes_and_meta(
     path: &Path,
 ) -> anyhow::Result<([u8; 32], [u8; 32], String, u64)> {
+    compute_file_hashes_with_progress(
+        path,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+    )
+}
+
+pub fn compute_file_hashes_with_progress(
+    path: &Path,
+    cancelled: Arc<AtomicBool>,
+    progress: Arc<AtomicU64>,
+) -> anyhow::Result<([u8; 32], [u8; 32], String, u64)> {
     let file = File::open(path).with_context(|| {
         format!(
             "Failed to open file for signature check: {}",
@@ -73,6 +89,9 @@ pub fn compute_file_hashes_and_meta(
     let mut buffer = [0u8; 65536];
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("file hashing cancelled");
+        }
         let bytes_read = reader
             .read(&mut buffer)
             .context("Error reading file stream for BLAKE3 hashing")?;
@@ -81,6 +100,7 @@ pub fn compute_file_hashes_and_meta(
         }
         blake3_hasher.update(&buffer[..bytes_read]);
         sha256_hasher.update(&buffer[..bytes_read]);
+        progress.fetch_add(bytes_read as u64, Ordering::Relaxed);
     }
 
     let blake3 = *blake3_hasher.finalize().as_bytes();

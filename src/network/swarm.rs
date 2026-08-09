@@ -6,8 +6,8 @@ use crate::network::controller::{
     NetworkCommand, NetworkEvent, NetworkSnapshot, PeerSnapshot, Reachability,
 };
 use crate::network::limits::{
-    INVALID_SIGNATURE_BLOCK, MALFORMED_BLOCK, MAX_BLOCKED_PEERS, MAX_IDENTIFY_ADDRESSES,
-    MINOR_BLOCK, TARGET_CONNECTED_PEERS,
+    DENIED_CONNECTION_TTL, INVALID_SIGNATURE_BLOCK, MALFORMED_BLOCK, MAX_BLOCKED_PEERS,
+    MAX_DENIED_CONNECTIONS, MAX_IDENTIFY_ADDRESSES, MINOR_BLOCK, TARGET_CONNECTED_PEERS,
 };
 use crate::network::metrics::{NetworkMetrics, ProcessSampler};
 use crate::network::rate_limit::RateLimiter;
@@ -15,13 +15,15 @@ use crate::network::replay::{ReplayDecision, ReplayState};
 use crate::protocol::record::{unix_time_ms, FlaggedFileRecord, RecordValidation, RecordValidator};
 use crate::protocol::sync::{
     InventorySummary, SyncErrorCode, SyncRequest, SyncResponse, MAX_IDS_PER_RESPONSE,
-    MAX_REQUESTED_RECORDS, MAX_SIMULTANEOUS_SYNC_PEERS,
+    MAX_PENDING_SYNC_REQUESTS_PER_PEER, MAX_REQUESTED_RECORDS, MAX_SIMULTANEOUS_SYNC_PEERS,
 };
 use crate::protocol::version::GOSSIP_TOPIC;
-use crate::storage::{PersistEvent, PersistRequest, PersistenceHandle, SharedSignatureDb};
+use crate::storage::{
+    PersistError, PersistEvent, PersistRequest, PersistenceHandle, SharedSignatureDb,
+};
 use futures::StreamExt;
 use libp2p::{
-    autonat, gossipsub, identify, kad, mdns,
+    autonat, gossipsub, identify, kad, mdns, relay,
     multiaddr::Protocol,
     ping, request_response,
     swarm::{Swarm, SwarmEvent},
@@ -29,7 +31,7 @@ use libp2p::{
 };
 use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
@@ -102,7 +104,14 @@ async fn run_swarm(
     let (db_action_tx, mut db_action_rx) = mpsc::channel(64);
     let database_records = database.count();
     let database_size_bytes = database.database_size_bytes();
+    let storage_safety = database.storage_safety_status().ok();
     let mut replay = ReplayState::default();
+    replay.load_persistent_state(
+        database.origin_highest_sequences().unwrap_or_default(),
+        database
+            .active_record_ids(unix_time_ms())
+            .unwrap_or_default(),
+    );
     let replay_now = Instant::now();
     for (record_id, origin, sequence) in database
         .recent_replay_seeds(
@@ -142,7 +151,15 @@ async fn run_swarm(
         connection_attempts: LruCache::new(
             NonZeroUsize::new(10_000).expect("non-zero connection-source limit"),
         ),
-        denied_connections: HashSet::new(),
+        denied_connections: DeniedConnections::new(),
+        external_candidates: LruCache::new(
+            NonZeroUsize::new(1_024).expect("non-zero external candidates"),
+        ),
+        promoted_external: HashMap::new(),
+        storage_safety_mode: storage_safety.as_ref().is_some_and(|status| !status.safe),
+        storage_safety_reason: storage_safety.and_then(|status| status.reason),
+        allow_private_test_network: config.allow_private_test_network,
+        sync_records_response_delay: config.sync_records_response_delay,
     };
     try_event(
         event_tx,
@@ -189,6 +206,7 @@ fn build_swarm(
 ) -> anyhow::Result<Swarm<ProtonetBehaviour>> {
     let mdns = config.enable_mdns;
     let relay_server = config.enable_relay_server;
+    let peer_scoring = !config.allow_private_test_network;
     let swarm = SwarmBuilder::with_existing_identity(identity.keypair.clone())
         .with_tokio()
         .with_tcp(
@@ -200,7 +218,7 @@ fn build_swarm(
         .with_dns()?
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(move |key, relay| {
-            ProtonetBehaviour::new(key, relay, mdns, relay_server)
+            ProtonetBehaviour::new(key, relay, mdns, relay_server, peer_scoring)
                 .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
         })?
         .with_swarm_config(|config| {
@@ -264,7 +282,13 @@ struct Actor<'a> {
     database_size_bytes: u64,
     process_sampler: ProcessSampler,
     connection_attempts: LruCache<String, WindowCounter>,
-    denied_connections: HashSet<libp2p::swarm::ConnectionId>,
+    denied_connections: DeniedConnections,
+    external_candidates: LruCache<Multiaddr, ExternalCandidate>,
+    promoted_external: HashMap<Multiaddr, Instant>,
+    storage_safety_mode: bool,
+    storage_safety_reason: Option<String>,
+    allow_private_test_network: bool,
+    sync_records_response_delay: Duration,
 }
 
 #[derive(Debug)]
@@ -277,8 +301,9 @@ enum PendingSync {
 #[derive(Debug)]
 struct SyncSession {
     started: Instant,
+    differing_buckets: VecDeque<i64>,
+    outstanding: HashSet<request_response::OutboundRequestId>,
     received: u64,
-    pending: usize,
 }
 
 enum DbAction {
@@ -289,10 +314,12 @@ enum DbAction {
     },
     InventoryCompared {
         peer: PeerId,
-        differing_bucket: Option<i64>,
+        request_id: request_response::OutboundRequestId,
+        differing_buckets: Vec<i64>,
     },
     IdsCompared {
         peer: PeerId,
+        request_id: request_response::OutboundRequestId,
         bucket: i64,
         missing: Vec<[u8; 32]>,
         next_cursor: Option<[u8; 32]>,
@@ -300,7 +327,53 @@ enum DbAction {
     Maintenance {
         records: usize,
         database_size_bytes: u64,
+        storage_safe: bool,
+        storage_reason: Option<String>,
     },
+}
+
+struct ExternalCandidate {
+    contributors: HashSet<PeerId>,
+    updated: Instant,
+}
+
+struct DeniedConnections {
+    values: LruCache<libp2p::swarm::ConnectionId, Instant>,
+}
+
+impl DeniedConnections {
+    fn new() -> Self {
+        Self {
+            values: LruCache::new(
+                NonZeroUsize::new(MAX_DENIED_CONNECTIONS)
+                    .expect("non-zero denied connection limit"),
+            ),
+        }
+    }
+
+    fn insert(&mut self, id: libp2p::swarm::ConnectionId, now: Instant) {
+        self.purge(now);
+        self.values.put(id, now + DENIED_CONNECTION_TTL);
+    }
+
+    fn remove(&mut self, id: &libp2p::swarm::ConnectionId) -> bool {
+        self.values.pop(id).is_some()
+    }
+
+    fn purge(&mut self, now: Instant) {
+        while self
+            .values
+            .peek_lru()
+            .is_some_and(|(_, expires)| *expires <= now)
+        {
+            self.values.pop_lru();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.values.len()
+    }
 }
 
 impl Actor<'_> {
@@ -312,6 +385,10 @@ impl Actor<'_> {
                 file_size,
                 file_name,
             } => {
+                if self.storage_safety_mode {
+                    self.violation(None, "storage safety mode blocks new records");
+                    return;
+                }
                 if sign_tx
                     .try_send(SignRequest {
                         sha256,
@@ -356,18 +433,17 @@ impl Actor<'_> {
     }
 
     fn handle_signed_record(&mut self, result: anyhow::Result<FlaggedFileRecord>) {
+        if self.storage_safety_mode {
+            self.violation(None, "storage safety mode blocks new records");
+            return;
+        }
         match result {
             Ok(record) => {
-                self.replay.accept(
-                    record.record_id,
-                    self.identity.peer_id,
-                    record.sequence,
-                    Instant::now(),
-                );
                 if !self.persistence.try_enqueue(PersistRequest {
                     record,
                     source: None,
                     received_at: Instant::now(),
+                    gossip_validation: None,
                 }) {
                     self.metrics
                         .queue_saturations
@@ -380,33 +456,115 @@ impl Actor<'_> {
     }
 
     fn handle_persisted(&mut self, event: PersistEvent) {
-        self.metrics.record_persistence(event.persistence_micros);
-        if !event.inserted {
-            self.metrics
-                .duplicates_ignored
-                .fetch_add(1, Ordering::Relaxed);
-            return;
+        let (
+            record,
+            source,
+            received_at,
+            persistence_micros,
+            database_size_bytes,
+            gossip_validation,
+        ) = match event {
+            PersistEvent::Stored {
+                record,
+                source,
+                received_at,
+                persistence_micros,
+                database_size_bytes,
+                gossip_validation,
+            } => (
+                *record,
+                source,
+                received_at,
+                persistence_micros,
+                database_size_bytes,
+                gossip_validation,
+            ),
+            PersistEvent::Duplicate {
+                record_id,
+                origin,
+                sequence,
+                persistence_micros,
+                database_size_bytes,
+                gossip_validation,
+            } => {
+                if let Some(origin) = origin {
+                    self.replay
+                        .accept(record_id, origin, sequence, Instant::now());
+                } else {
+                    self.replay.forget(&record_id);
+                }
+                self.metrics.record_persistence(persistence_micros);
+                self.database_size_bytes = database_size_bytes;
+                self.metrics
+                    .duplicates_ignored
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some((message_id, source)) = gossip_validation {
+                    self.report_gossip(&message_id, &source, gossipsub::MessageAcceptance::Ignore);
+                }
+                return;
+            }
+            PersistEvent::Failed {
+                record_id,
+                error,
+                persistence_micros,
+                database_size_bytes,
+                gossip_validation,
+            } => {
+                self.replay.forget(&record_id);
+                self.metrics.record_persistence(persistence_micros);
+                self.database_size_bytes = database_size_bytes;
+                let reason = match error {
+                    PersistError::StorageSafety(reason) => reason,
+                    PersistError::Database(reason) => {
+                        format!("database persistence failed: {reason}")
+                    }
+                };
+                self.storage_safety_mode = true;
+                self.storage_safety_reason = Some(reason.clone());
+                try_event(
+                    self.event_tx,
+                    NetworkEvent::StorageSafetyChanged {
+                        active: true,
+                        reason: Some(reason.clone()),
+                    },
+                );
+                self.violation(
+                    None,
+                    &format!(
+                        "record {} was not persisted: {reason}",
+                        crate::signature::hasher::hex(&record_id)
+                    ),
+                );
+                if let Some((message_id, source)) = gossip_validation {
+                    self.report_gossip(&message_id, &source, gossipsub::MessageAcceptance::Ignore);
+                }
+                return;
+            }
+        };
+        if let Ok(origin) = record.origin_peer_id() {
+            self.replay
+                .accept(record.record_id, origin, record.sequence, Instant::now());
         }
+        if let Some((message_id, source)) = gossip_validation {
+            self.report_gossip(&message_id, &source, gossipsub::MessageAcceptance::Accept);
+        }
+        self.metrics.record_persistence(persistence_micros);
         self.database_records = self.database_records.saturating_add(1);
-        self.database_size_bytes = event.database_size_bytes;
-        let elapsed = event
-            .received_at
-            .elapsed()
-            .as_micros()
-            .min(u64::MAX as u128) as u64;
+        self.database_size_bytes = database_size_bytes;
+        let elapsed = received_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
         self.metrics.record_propagation(elapsed);
-        if let Some(source) = event.source {
+        if let Some(source) = source {
             self.metrics
                 .records_received
                 .fetch_add(1, Ordering::Relaxed);
             self.connections
-                .note_record(&source, event.record.encode().map(|v| v.len()).unwrap_or(0));
+                .note_record(&source, record.encode().map(|v| v.len()).unwrap_or(0));
             try_event(
                 self.event_tx,
                 NetworkEvent::RecordReceived {
-                    record_id: event.record.record_id,
+                    record_id: record.record_id,
                     from: source,
-                    file_name: event.record.file_name,
+                    file_name: record.file_name,
                 },
             );
             if let Some(session) = self.sync_sessions.get_mut(&source) {
@@ -420,10 +578,10 @@ impl Actor<'_> {
                 );
             }
         } else {
-            if event.record.origin_peer_id().ok() != Some(self.identity.peer_id) {
+            if record.origin_peer_id().ok() != Some(self.identity.peer_id) {
                 return;
             }
-            match event.record.encode() {
+            match record.encode() {
                 Ok(encoded) => match self
                     .swarm
                     .behaviour_mut()
@@ -438,8 +596,8 @@ impl Actor<'_> {
                         try_event(
                             self.event_tx,
                             NetworkEvent::RecordPublished {
-                                record_id: event.record.record_id,
-                                file_name: event.record.file_name,
+                                record_id: record.record_id,
+                                file_name: record.file_name,
                             },
                         );
                     }
@@ -469,6 +627,14 @@ impl Actor<'_> {
                 }
                 if self.is_blocked(&peer_id) {
                     let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+                if !self.connections.can_accept(&endpoint) {
+                    self.swarm.close_connection(connection_id);
+                    self.violation(
+                        Some(peer_id),
+                        "connection diversity limit reached for source prefix",
+                    );
                     return;
                 }
                 if num_established.get() > 1 {
@@ -502,19 +668,45 @@ impl Actor<'_> {
                     self.start_sync(peer_id);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                ..
+            } => {
+                self.denied_connections.remove(&connection_id);
                 if self.connections.disconnected(&peer_id) {
                     self.sync_sessions.remove(&peer_id);
+                    self.pending_sync.retain(|_, pending| match pending {
+                        PendingSync::Inventory { peer }
+                        | PendingSync::Ids { peer, .. }
+                        | PendingSync::Records { peer } => peer != &peer_id,
+                    });
                     try_event(self.event_tx, NetworkEvent::PeerDisconnected { peer_id });
                 }
             }
             SwarmEvent::NewListenAddr { address, .. } => {
                 if !self.listen_addresses.contains(&address) {
                     self.listen_addresses.push(address.clone());
-                    try_event(self.event_tx, NetworkEvent::Listening { address });
+                    try_event(self.event_tx, NetworkEvent::Listening { address: address.clone() });
+                }
+                if self.allow_private_test_network {
+                    self.swarm.add_external_address(address);
                 }
             }
             SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.listen_addresses.retain(|item| item != &address);
+            }
+            SwarmEvent::ExternalAddrConfirmed { address } => {
+                if address
+                    .iter()
+                    .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+                    && !self.listen_addresses.contains(&address)
+                {
+                    self.listen_addresses.push(address.clone());
+                    try_event(self.event_tx, NetworkEvent::Listening { address });
+                }
+            }
+            SwarmEvent::ExternalAddrExpired { address } => {
                 self.listen_addresses.retain(|item| item != &address);
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -526,7 +718,12 @@ impl Actor<'_> {
                     )),
                 );
             }
-            SwarmEvent::IncomingConnectionError { error, .. } => {
+            SwarmEvent::IncomingConnectionError {
+                connection_id,
+                error,
+                ..
+            } => {
+                self.denied_connections.remove(&connection_id);
                 self.violation(None, &format!("inbound connection rejected: {error}"));
             }
             SwarmEvent::IncomingConnection {
@@ -541,8 +738,12 @@ impl Actor<'_> {
                     .get_or_insert_mut(key, || WindowCounter::new(10, Duration::from_secs(60)))
                     .take(now);
                 if !allowed {
-                    self.denied_connections.insert(connection_id);
+                    self.denied_connections.insert(connection_id, now);
+                    self.swarm.close_connection(connection_id);
                 }
+            }
+            SwarmEvent::ListenerError { error, .. } => {
+                self.violation(None, &format!("listener failed: {error}"));
             }
             _ => {}
         }
@@ -614,8 +815,10 @@ impl Actor<'_> {
                         .add_address(&peer_id, address.clone());
                     self.swarm.add_peer_address(peer_id, address);
                 }
-                if valid_announced_address(&info.observed_addr) {
+                if self.allow_private_test_network && address_is_private(&info.observed_addr) {
                     self.swarm.add_external_address(info.observed_addr);
+                } else {
+                    self.observe_external_address(peer_id, info.observed_addr);
                 }
             }
             BehaviourEvent::Ping(ping::Event { peer, result, .. }) => {
@@ -625,8 +828,17 @@ impl Actor<'_> {
             }
             BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. }) => {
                 self.reachability = match new {
-                    autonat::NatStatus::Public(_) => Reachability::Public,
-                    autonat::NatStatus::Private => Reachability::Private,
+                    autonat::NatStatus::Public(address) => {
+                        if public_external_address(&address) {
+                            self.swarm.add_external_address(address.clone());
+                            self.promoted_external.insert(address, Instant::now());
+                        }
+                        Reachability::Public
+                    }
+                    autonat::NatStatus::Private => {
+                        self.clear_promoted_external();
+                        Reachability::Private
+                    }
                     autonat::NatStatus::Unknown => Reachability::Unknown,
                 };
                 try_event(
@@ -652,14 +864,24 @@ impl Actor<'_> {
                     NetworkEvent::LogMessage(format!("direct-connection upgrade: {event:?}")),
                 );
             }
-            BehaviourEvent::RelayClient(event) => {
+            BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
+                ..
+            }) => try_event(
+                self.event_tx,
+                NetworkEvent::RelayReservation { relay_peer_id },
+            ),
+            BehaviourEvent::RelayClient(event) => try_event(
+                self.event_tx,
+                NetworkEvent::LogMessage(format!("relay client: {event:?}")),
+            ),
+            BehaviourEvent::RelayServer(event) => {
                 try_event(
                     self.event_tx,
-                    NetworkEvent::LogMessage(format!("relay client: {event:?}")),
+                    NetworkEvent::LogMessage(format!("relay server: {event:?}")),
                 );
             }
-            BehaviourEvent::RelayServer(_)
-            | BehaviourEvent::Identify(_)
+            BehaviourEvent::Identify(_)
             | BehaviourEvent::Autonat(_)
             | BehaviourEvent::Kad(_)
             | BehaviourEvent::ConnectionLimits(_)
@@ -673,7 +895,8 @@ impl Actor<'_> {
         self.metrics
             .bytes_received
             .fetch_add(data.len() as u64, Ordering::Relaxed);
-        if self.is_blocked(&source)
+        if self.storage_safety_mode
+            || self.is_blocked(&source)
             || !self.rate_limiter.allow_gossip(source, data.len(), now)
             || !self.global_records.take(now)
         {
@@ -731,14 +954,18 @@ impl Actor<'_> {
                 self.violation(Some(source), "record sequence is outside the replay window");
             }
             ReplayDecision::New => {
+                if !self.allow_ingestion_source(source, now) {
+                    self.report_gossip(&message_id, &source, gossipsub::MessageAcceptance::Reject);
+                    self.block(source, MINOR_BLOCK);
+                    return;
+                }
                 if self.persistence.try_enqueue(PersistRequest {
                     record: record.clone(),
                     source: Some(source),
                     received_at: Instant::now(),
+                    gossip_validation: Some((message_id.clone(), source)),
                 }) {
-                    self.replay
-                        .accept(record.record_id, origin, record.sequence, now);
-                    self.report_gossip(&message_id, &source, gossipsub::MessageAcceptance::Accept);
+                    self.replay.mark_pending(record.record_id, now);
                 } else {
                     self.metrics
                         .queue_saturations
@@ -778,7 +1005,10 @@ impl Actor<'_> {
                 peer, request_id, ..
             } => {
                 self.pending_sync.remove(&request_id);
-                self.finish_sync(peer);
+                if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                    session.outstanding.remove(&request_id);
+                }
+                self.pump_sync(peer);
             }
             request_response::Event::InboundFailure { peer, .. } => {
                 self.violation(Some(peer), "malformed or stalled synchronization request");
@@ -806,6 +1036,9 @@ impl Actor<'_> {
         }
         let database = self.database.clone();
         let tx = self.db_action_tx.clone();
+        let response_delay = matches!(&request, SyncRequest::GetRecords { .. })
+            .then_some(self.sync_records_response_delay)
+            .unwrap_or(Duration::ZERO);
         tokio::task::spawn_blocking(move || {
             let response = match request {
                 SyncRequest::GetInventory => database
@@ -830,6 +1063,9 @@ impl Actor<'_> {
             .unwrap_or(SyncResponse::Error {
                 code: SyncErrorCode::Internal,
             });
+            if !response_delay.is_zero() {
+                std::thread::sleep(response_delay);
+            }
             let _ = tx.blocking_send(DbAction::SendResponse {
                 peer,
                 channel,
@@ -852,7 +1088,19 @@ impl Actor<'_> {
         let Some(pending) = self.pending_sync.remove(&request_id) else {
             return;
         };
+        if matches!(&pending, PendingSync::Ids { .. })
+            && self.pending_sync.values().any(|candidate| {
+                matches!(candidate, PendingSync::Records { peer: candidate_peer } if *candidate_peer == peer)
+            })
+        {
+            self.metrics
+                .sync_response_reorders
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if response.validate_bounds().is_err() {
+            if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                session.outstanding.remove(&request_id);
+            }
             self.violation(Some(peer), "oversized synchronization response");
             self.block(peer, MALFORMED_BLOCK);
             let _ = self.swarm.disconnect_peer_id(peer);
@@ -864,10 +1112,11 @@ impl Actor<'_> {
                 let tx = self.db_action_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let local = database.inventory(unix_time_ms()).unwrap_or_default();
-                    let bucket = differing_bucket(&local, &remote);
+                    let buckets = differing_buckets(&local, &remote);
                     let _ = tx.blocking_send(DbAction::InventoryCompared {
                         peer,
-                        differing_bucket: bucket,
+                        request_id,
+                        differing_buckets: buckets,
                     });
                 });
             }
@@ -888,6 +1137,7 @@ impl Actor<'_> {
                         .collect();
                     let _ = tx.blocking_send(DbAction::IdsCompared {
                         peer,
+                        request_id,
                         bucket,
                         missing,
                         next_cursor,
@@ -895,12 +1145,18 @@ impl Actor<'_> {
                 });
             }
             (PendingSync::Records { peer }, SyncResponse::Records { records }) => {
+                if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                    session.outstanding.remove(&request_id);
+                }
                 self.accept_sync_records(peer, records);
-                self.decrement_sync_pending(peer);
+                self.pump_sync(peer);
             }
             _ => {
                 self.violation(Some(peer), "unexpected synchronization response");
-                self.finish_sync(peer);
+                if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                    session.outstanding.remove(&request_id);
+                }
+                self.pump_sync(peer);
             }
         }
     }
@@ -931,30 +1187,25 @@ impl Actor<'_> {
             }
             DbAction::InventoryCompared {
                 peer,
-                differing_bucket,
+                request_id,
+                differing_buckets,
             } => {
-                if let Some(bucket) = differing_bucket {
-                    let id = self.swarm.behaviour_mut().sync.send_request(
-                        &peer,
-                        SyncRequest::GetRecordIds {
-                            bucket_start: bucket,
-                            cursor: None,
-                            limit: MAX_IDS_PER_RESPONSE as u16,
-                        },
-                    );
-                    self.pending_sync
-                        .insert(id, PendingSync::Ids { peer, bucket });
-                } else {
-                    self.finish_sync(peer);
+                if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                    session.outstanding.remove(&request_id);
+                    session.differing_buckets = differing_buckets.into();
                 }
+                self.pump_sync(peer);
             }
             DbAction::IdsCompared {
                 peer,
+                request_id,
                 bucket,
                 missing,
                 next_cursor,
             } => {
-                let mut pending = 0;
+                if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                    session.outstanding.remove(&request_id);
+                }
                 if !missing.is_empty() {
                     let id = self
                         .swarm
@@ -962,39 +1213,64 @@ impl Actor<'_> {
                         .sync
                         .send_request(&peer, SyncRequest::GetRecords { ids: missing });
                     self.pending_sync.insert(id, PendingSync::Records { peer });
-                    pending += 1;
+                    if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                        session.outstanding.insert(id);
+                    }
                 }
                 if let Some(cursor) = next_cursor {
-                    let id = self.swarm.behaviour_mut().sync.send_request(
-                        &peer,
-                        SyncRequest::GetRecordIds {
-                            bucket_start: bucket,
-                            cursor: Some(cursor),
-                            limit: MAX_IDS_PER_RESPONSE as u16,
-                        },
-                    );
-                    self.pending_sync
-                        .insert(id, PendingSync::Ids { peer, bucket });
-                    pending += 1;
+                    let can_send = self.sync_sessions.get(&peer).is_some_and(|session| {
+                        session.outstanding.len() < MAX_PENDING_SYNC_REQUESTS_PER_PEER
+                    });
+                    if can_send {
+                        let id = self.swarm.behaviour_mut().sync.send_request(
+                            &peer,
+                            SyncRequest::GetRecordIds {
+                                bucket_start: bucket,
+                                cursor: Some(cursor),
+                                limit: MAX_IDS_PER_RESPONSE as u16,
+                            },
+                        );
+                        self.pending_sync
+                            .insert(id, PendingSync::Ids { peer, bucket });
+                        if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                            session.outstanding.insert(id);
+                        }
+                    } else if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                        session.differing_buckets.push_front(bucket);
+                    }
                 }
-                if let Some(session) = self.sync_sessions.get_mut(&peer) {
-                    session.pending = pending;
-                }
-                if pending == 0 {
-                    self.finish_sync(peer);
-                }
+                self.pump_sync(peer);
             }
             DbAction::Maintenance {
                 records,
                 database_size_bytes,
+                storage_safe,
+                storage_reason,
             } => {
                 self.database_records = records;
                 self.database_size_bytes = database_size_bytes;
+                let active = !storage_safe;
+                if active != self.storage_safety_mode
+                    || storage_reason != self.storage_safety_reason
+                {
+                    self.storage_safety_mode = active;
+                    self.storage_safety_reason = storage_reason.clone();
+                    try_event(
+                        self.event_tx,
+                        NetworkEvent::StorageSafetyChanged {
+                            active,
+                            reason: storage_reason,
+                        },
+                    );
+                }
             }
         }
     }
 
     fn accept_sync_records(&mut self, peer: PeerId, records: Vec<FlaggedFileRecord>) {
+        if self.storage_safety_mode {
+            return;
+        }
         for record in records.into_iter().take(MAX_REQUESTED_RECORDS) {
             let now = Instant::now();
             if self.validator.validate(&record, unix_time_ms()).is_err() {
@@ -1017,13 +1293,17 @@ impl Actor<'_> {
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
+            if !self.allow_ingestion_source(peer, now) {
+                self.block(peer, MINOR_BLOCK);
+                break;
+            }
             if self.persistence.try_enqueue(PersistRequest {
                 record: record.clone(),
                 source: Some(peer),
                 received_at: now,
+                gossip_validation: None,
             }) {
-                self.replay
-                    .accept(record.record_id, origin, record.sequence, now);
+                self.replay.mark_pending(record.record_id, now);
             } else {
                 self.metrics
                     .queue_saturations
@@ -1046,15 +1326,24 @@ impl Actor<'_> {
             .send_request(&peer, SyncRequest::GetInventory);
         self.pending_sync
             .insert(request_id, PendingSync::Inventory { peer });
+        let mut outstanding = HashSet::new();
+        outstanding.insert(request_id);
         self.sync_sessions.insert(
             peer,
             SyncSession {
                 started: Instant::now(),
+                differing_buckets: VecDeque::new(),
+                outstanding,
                 received: 0,
-                pending: 1,
             },
         );
         try_event(self.event_tx, NetworkEvent::SyncStarted { peer_id: peer });
+    }
+
+    fn allow_ingestion_source(&mut self, peer: PeerId, now: Instant) -> bool {
+        self.connections
+            .source_keys(&peer)
+            .is_some_and(|(ip, prefix)| self.rate_limiter.allow_ingestion_source(ip, prefix, now))
     }
 
     fn start_best_sync_peer(&mut self) {
@@ -1073,14 +1362,80 @@ impl Actor<'_> {
         }
     }
 
-    fn decrement_sync_pending(&mut self, peer: PeerId) {
-        if let Some(session) = self.sync_sessions.get_mut(&peer) {
-            session.pending = session.pending.saturating_sub(1);
-            if session.pending > 0 {
+    fn observe_external_address(&mut self, peer: PeerId, address: Multiaddr) {
+        let now = Instant::now();
+        if record_external_observation(&mut self.external_candidates, peer, address.clone(), now) {
+            self.swarm.add_external_address(address.clone());
+            self.promoted_external.insert(address, now);
+        }
+    }
+
+    fn expire_external_addresses(&mut self, now: Instant) {
+        let ttl = Duration::from_secs(30 * 60);
+        let stale_candidates: Vec<_> = self
+            .external_candidates
+            .iter()
+            .filter(|(_, candidate)| now.saturating_duration_since(candidate.updated) > ttl)
+            .map(|(address, _)| address.clone())
+            .collect();
+        for address in stale_candidates {
+            self.external_candidates.pop(&address);
+        }
+        let stale_promoted: Vec<_> = self
+            .promoted_external
+            .iter()
+            .filter(|(_, updated)| now.saturating_duration_since(**updated) > ttl)
+            .map(|(address, _)| address.clone())
+            .collect();
+        for address in stale_promoted {
+            self.promoted_external.remove(&address);
+            self.swarm.remove_external_address(&address);
+        }
+    }
+
+    fn clear_promoted_external(&mut self) {
+        let addresses: Vec<_> = self.promoted_external.keys().cloned().collect();
+        for address in addresses {
+            self.swarm.remove_external_address(&address);
+        }
+        self.promoted_external.clear();
+    }
+
+    fn pump_sync(&mut self, peer: PeerId) {
+        loop {
+            let next = {
+                let Some(session) = self.sync_sessions.get_mut(&peer) else {
+                    return;
+                };
+                if session.outstanding.len() >= MAX_PENDING_SYNC_REQUESTS_PER_PEER {
+                    return;
+                }
+                session.differing_buckets.pop_front()
+            };
+            let Some(bucket) = next else {
+                let complete = self
+                    .sync_sessions
+                    .get(&peer)
+                    .is_some_and(|session| session.outstanding.is_empty());
+                if complete {
+                    self.finish_sync(peer);
+                }
                 return;
+            };
+            let id = self.swarm.behaviour_mut().sync.send_request(
+                &peer,
+                SyncRequest::GetRecordIds {
+                    bucket_start: bucket,
+                    cursor: None,
+                    limit: MAX_IDS_PER_RESPONSE as u16,
+                },
+            );
+            self.pending_sync
+                .insert(id, PendingSync::Ids { peer, bucket });
+            if let Some(session) = self.sync_sessions.get_mut(&peer) {
+                session.outstanding.insert(id);
             }
         }
-        self.finish_sync(peer);
     }
 
     fn finish_sync(&mut self, peer: PeerId) {
@@ -1124,6 +1479,8 @@ impl Actor<'_> {
 
     fn update_snapshot(&mut self) {
         let now = Instant::now();
+        self.denied_connections.purge(now);
+        self.expire_external_addresses(now);
         for peer in self
             .connections
             .unverified_peers_older_than(crate::network::limits::HANDSHAKE_TIMEOUT, now)
@@ -1141,6 +1498,11 @@ impl Actor<'_> {
             .map(|(peer, _)| *peer)
             .collect();
         for peer in timed_out {
+            self.pending_sync.retain(|_, pending| match pending {
+                PendingSync::Inventory { peer: owner }
+                | PendingSync::Ids { peer: owner, .. }
+                | PendingSync::Records { peer: owner } => owner != &peer,
+            });
             self.finish_sync(peer);
         }
         let topic = gossipsub::IdentTopic::new(GOSSIP_TOPIC);
@@ -1176,6 +1538,8 @@ impl Actor<'_> {
         snapshot.replay_cache_size = self.replay.recent_len();
         snapshot.database_records = self.database_records;
         snapshot.database_size_bytes = self.database_size_bytes;
+        snapshot.storage_safety_mode = self.storage_safety_mode;
+        snapshot.storage_safety_reason = self.storage_safety_reason.clone();
         snapshot.metrics = self.metrics.snapshot();
         let (cpu, memory) = self.process_sampler.sample();
         snapshot.metrics.process_cpu_percent = cpu;
@@ -1191,9 +1555,12 @@ impl Actor<'_> {
         let tx = self.db_action_tx.clone();
         tokio::task::spawn_blocking(move || {
             let _ = database.cleanup_expired(unix_time_ms());
+            let safety = database.storage_safety_status().ok();
             let _ = tx.blocking_send(DbAction::Maintenance {
                 records: database.count(),
                 database_size_bytes: database.database_size_bytes(),
+                storage_safe: safety.as_ref().is_some_and(|status| status.safe),
+                storage_reason: safety.and_then(|status| status.reason),
             });
         });
     }
@@ -1243,7 +1610,7 @@ struct SignRequest {
     file_name: Option<String>,
 }
 
-fn differing_bucket(local: &InventorySummary, remote: &InventorySummary) -> Option<i64> {
+fn differing_buckets(local: &InventorySummary, remote: &InventorySummary) -> Vec<i64> {
     let local: HashMap<_, _> = local
         .bucket_digests
         .iter()
@@ -1252,10 +1619,11 @@ fn differing_bucket(local: &InventorySummary, remote: &InventorySummary) -> Opti
     remote
         .bucket_digests
         .iter()
-        .find(|bucket| {
+        .filter(|bucket| {
             local.get(&bucket.start_unix).copied() != Some((bucket.record_count, bucket.digest))
         })
         .map(|bucket| bucket.start_unix)
+        .collect()
 }
 
 fn without_trailing_peer(address: &Multiaddr) -> Multiaddr {
@@ -1275,6 +1643,70 @@ fn valid_announced_address(address: &Multiaddr) -> bool {
         Protocol::Ip6(ip) => ip.is_unspecified() || ip.is_multicast(),
         _ => false,
     })
+}
+
+fn public_external_address(address: &Multiaddr) -> bool {
+    if !valid_announced_address(address) {
+        return false;
+    }
+    let mut has_public_ip = false;
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                let octets = ip.octets();
+                let reserved = ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_broadcast()
+                    || ip.is_multicast()
+                    || ip.is_documentation()
+                    || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                    || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+                    || octets[0] >= 240;
+                if reserved {
+                    return false;
+                }
+                has_public_ip = true;
+            }
+            Protocol::Ip6(ip) => {
+                let first = ip.segments()[0];
+                if ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+                    || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+                {
+                    return false;
+                }
+                has_public_ip = true;
+            }
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                return false
+            }
+            _ => {}
+        }
+    }
+    has_public_ip
+}
+
+fn record_external_observation(
+    candidates: &mut LruCache<Multiaddr, ExternalCandidate>,
+    peer: PeerId,
+    address: Multiaddr,
+    now: Instant,
+) -> bool {
+    if !public_external_address(&address) {
+        return false;
+    }
+    let candidate = candidates.get_or_insert_mut(address, || ExternalCandidate {
+        contributors: HashSet::new(),
+        updated: now,
+    });
+    candidate.contributors.insert(peer);
+    candidate.updated = now;
+    candidate.contributors.len() >= 3
 }
 
 fn address_is_private(address: &Multiaddr) -> bool {
@@ -1349,10 +1781,10 @@ mod tests {
             }],
             ..InventorySummary::default()
         };
-        assert_eq!(differing_bucket(&local, &local), None);
+        assert!(differing_buckets(&local, &local).is_empty());
         let mut remote = local.clone();
         remote.bucket_digests[0].digest = [2; 32];
-        assert_eq!(differing_bucket(&local, &remote), Some(1));
+        assert_eq!(differing_buckets(&local, &remote), vec![1]);
     }
 
     #[test]
@@ -1362,6 +1794,68 @@ mod tests {
         ));
         assert!(valid_announced_address(
             &"/ip4/192.168.1.2/tcp/1".parse().unwrap()
+        ));
+        assert!(!public_external_address(
+            &"/ip4/192.168.1.2/tcp/1".parse().unwrap()
+        ));
+        assert!(public_external_address(
+            &"/ip4/8.8.8.8/udp/443/quic-v1".parse().unwrap()
+        ));
+        assert!(!public_external_address(
+            &"/dns4/rebind.example/tcp/1".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn rejected_handshake_tracking_stays_bounded_after_one_hundred_thousand_aborts() {
+        let mut denied = DeniedConnections::new();
+        let now = Instant::now();
+        for id in 0..100_000 {
+            let connection = libp2p::swarm::ConnectionId::new_unchecked(id);
+            denied.insert(connection, now);
+            if id % 2 == 0 {
+                denied.remove(&connection);
+            }
+        }
+        assert!(denied.len() <= MAX_DENIED_CONNECTIONS);
+        denied.purge(now + DENIED_CONNECTION_TTL + Duration::from_secs(1));
+        assert_eq!(denied.len(), 0);
+    }
+
+    #[test]
+    fn external_address_requires_independent_matching_public_observers() {
+        let mut candidates = LruCache::new(NonZeroUsize::new(8).expect("non-zero"));
+        let address: Multiaddr = "/ip4/8.8.8.8/udp/4001/quic-v1".parse().unwrap();
+        let first = PeerId::random();
+        assert!(!record_external_observation(
+            &mut candidates,
+            first,
+            address.clone(),
+            Instant::now(),
+        ));
+        assert!(!record_external_observation(
+            &mut candidates,
+            first,
+            address.clone(),
+            Instant::now(),
+        ));
+        assert!(!record_external_observation(
+            &mut candidates,
+            PeerId::random(),
+            address.clone(),
+            Instant::now(),
+        ));
+        assert!(record_external_observation(
+            &mut candidates,
+            PeerId::random(),
+            address,
+            Instant::now(),
+        ));
+        assert!(!record_external_observation(
+            &mut candidates,
+            PeerId::random(),
+            "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+            Instant::now(),
         ));
     }
 }

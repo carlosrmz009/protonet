@@ -122,6 +122,18 @@ pub fn render_topology_window(
                             );
                             stat(
                                 ui,
+                                "Storage safety",
+                                if snapshot.storage_safety_mode {
+                                    snapshot
+                                        .storage_safety_reason
+                                        .as_deref()
+                                        .unwrap_or("active")
+                                } else {
+                                    "normal"
+                                },
+                            );
+                            stat(
+                                ui,
                                 "Persistence queue",
                                 &snapshot.persistence_queue_depth.to_string(),
                             );

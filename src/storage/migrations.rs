@@ -3,6 +3,7 @@ PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
+PRAGMA auto_vacuum = INCREMENTAL;
 
 CREATE TABLE IF NOT EXISTS records (
     record_id BLOB PRIMARY KEY CHECK(length(record_id) = 32),
@@ -35,5 +36,10 @@ INSERT OR IGNORE INTO metadata(key, value) VALUES ('generation', x'0000000000000
 CREATE TABLE IF NOT EXISTS origin_sequences (
     origin_peer_id BLOB PRIMARY KEY,
     highest_sequence INTEGER NOT NULL CHECK(highest_sequence >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_daily (
+    day INTEGER PRIMARY KEY,
+    record_count INTEGER NOT NULL CHECK(record_count >= 0)
 );
 "#;

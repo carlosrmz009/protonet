@@ -1,6 +1,7 @@
 use crate::network::limits::{
-    GOSSIP_BYTES_PER_MINUTE, GOSSIP_RECORDS_PER_MINUTE, INVALID_MESSAGES_PER_MINUTE,
-    MAX_TRACKED_RATE_PEERS, SYNC_REQUESTS_PER_MINUTE, SYNC_RESPONSE_BYTES_PER_HOUR,
+    GOSSIP_BYTES_PER_MINUTE, GOSSIP_RECORDS_PER_MINUTE, INGESTION_RECORDS_PER_IP_PER_MINUTE,
+    INGESTION_RECORDS_PER_PREFIX_PER_MINUTE, INVALID_MESSAGES_PER_MINUTE, MAX_TRACKED_RATE_PEERS,
+    SYNC_REQUESTS_PER_MINUTE, SYNC_RESPONSE_BYTES_PER_HOUR,
 };
 use libp2p::PeerId;
 use lru::LruCache;
@@ -63,12 +64,20 @@ impl PeerBuckets {
 
 pub struct RateLimiter {
     peers: LruCache<PeerId, PeerBuckets>,
+    ingestion_ips: LruCache<String, Bucket>,
+    ingestion_prefixes: LruCache<String, Bucket>,
 }
 
 impl Default for RateLimiter {
     fn default() -> Self {
         Self {
             peers: LruCache::new(NonZeroUsize::new(MAX_TRACKED_RATE_PEERS).expect("non-zero")),
+            ingestion_ips: LruCache::new(
+                NonZeroUsize::new(MAX_TRACKED_RATE_PEERS).expect("non-zero"),
+            ),
+            ingestion_prefixes: LruCache::new(
+                NonZeroUsize::new(MAX_TRACKED_RATE_PEERS).expect("non-zero"),
+            ),
         }
     }
 }
@@ -93,6 +102,30 @@ impl RateLimiter {
 
     pub fn note_invalid(&mut self, peer: PeerId, now: Instant) -> bool {
         self.peer(peer, now).invalid.take(1, now)
+    }
+
+    pub fn allow_ingestion_source(&mut self, ip: String, prefix: String, now: Instant) -> bool {
+        let ip_allowed = self
+            .ingestion_ips
+            .get_or_insert_mut(ip, || {
+                Bucket::new(
+                    INGESTION_RECORDS_PER_IP_PER_MINUTE,
+                    Duration::from_secs(60),
+                    now,
+                )
+            })
+            .take(1, now);
+        let prefix_allowed = self
+            .ingestion_prefixes
+            .get_or_insert_mut(prefix, || {
+                Bucket::new(
+                    INGESTION_RECORDS_PER_PREFIX_PER_MINUTE,
+                    Duration::from_secs(60),
+                    now,
+                )
+            })
+            .take(1, now);
+        ip_allowed && prefix_allowed
     }
 }
 

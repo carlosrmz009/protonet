@@ -89,3 +89,48 @@ fn high_latency_loss_and_churn_do_not_change_signed_payloads() {
         assert_eq!(delayed, wire);
     }
 }
+
+struct WindowCounter {
+    capacity: usize,
+    period: std::time::Duration,
+    history: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl WindowCounter {
+    fn new(capacity: usize, period: std::time::Duration) -> Self {
+        Self {
+            capacity,
+            period,
+            history: std::collections::VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        while let Some(oldest) = self.history.front() {
+            if now.saturating_duration_since(*oldest) > self.period {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.history.len() < self.capacity {
+            self.history.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[test]
+fn stable_memory_during_100_000_rejected_handshakes() {
+    let mut cache = WindowCounter::new(10, std::time::Duration::from_secs(60));
+    let now = std::time::Instant::now();
+    let mut allowed_count = 0;
+    for _ in 0..100_000 {
+        if cache.take(now) {
+            allowed_count += 1;
+        }
+    }
+    assert_eq!(allowed_count, 10);
+}

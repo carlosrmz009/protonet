@@ -6,15 +6,13 @@ pub mod theme;
 pub mod topology;
 
 #[allow(unused_imports)]
-pub use manage_signatures::render_manage_signatures_tab;
+pub use manage_signatures::{render_manage_signatures_tab, ManageSignaturesState};
 #[allow(unused_imports)]
 pub use network_panel::{render_network_panel, NetworkState};
 #[allow(unused_imports)]
 pub use red_alert::render_red_alert_screen;
 #[allow(unused_imports)]
-pub use scanner_panel::{
-    create_sample_threat_file, handle_file_chosen, render_scanner_panel, ScannerState,
-};
+pub use scanner_panel::{create_sample_threat_file, render_scanner_panel, ScannerState};
 #[allow(unused_imports)]
 pub use theme::{apply_theme, setup_fonts, ThemeColors};
 #[allow(unused_imports)]

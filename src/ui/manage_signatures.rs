@@ -2,13 +2,41 @@ use crate::signature::SharedSignatureDb;
 use crate::ui::ThemeColors;
 use egui::{Color32, Frame, RichText, Rounding, Stroke, Vec2};
 
+const PAGE_SIZE: usize = 50;
+
+pub struct ManageSignaturesState {
+    page: usize,
+    total: usize,
+    signatures: Vec<crate::signature::FileSignature>,
+    dirty: bool,
+}
+
+impl Default for ManageSignaturesState {
+    fn default() -> Self {
+        Self {
+            page: 0,
+            total: 0,
+            signatures: Vec::new(),
+            dirty: true,
+        }
+    }
+}
+
 pub fn render_manage_signatures_tab(
     ui: &mut egui::Ui,
     shared_db: &SharedSignatureDb,
     logs: &mut Vec<String>,
+    state: &mut ManageSignaturesState,
 ) {
-    let all_sigs = shared_db.get_all_signatures();
-    let count = all_sigs.len();
+    if state.dirty {
+        state.total = shared_db.count();
+        let max_page = state.total.saturating_sub(1) / PAGE_SIZE;
+        state.page = state.page.min(max_page);
+        state.signatures =
+            shared_db.get_signatures_page(state.page.saturating_mul(PAGE_SIZE), PAGE_SIZE);
+        state.dirty = false;
+    }
+    let count = state.total;
 
     let banner_frame = Frame::none()
         .fill(ThemeColors::BG_CARD)
@@ -43,7 +71,35 @@ pub fn render_manage_signatures_tab(
 
     ui.add_space(16.0);
 
-    if all_sigs.is_empty() {
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(state.page > 0, egui::Button::new("Previous"))
+            .clicked()
+        {
+            state.page = state.page.saturating_sub(1);
+            state.dirty = true;
+        }
+        ui.label(format!(
+            "Page {} of {}",
+            state.page + 1,
+            count.saturating_sub(1) / PAGE_SIZE + 1
+        ));
+        if ui
+            .add_enabled(
+                (state.page + 1).saturating_mul(PAGE_SIZE) < count,
+                egui::Button::new("Next"),
+            )
+            .clicked()
+        {
+            state.page = state.page.saturating_add(1);
+            state.dirty = true;
+        }
+        if ui.button("Refresh").clicked() {
+            state.dirty = true;
+        }
+    });
+
+    if state.signatures.is_empty() {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
@@ -66,7 +122,7 @@ pub fn render_manage_signatures_tab(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            for sig in all_sigs {
+            for sig in state.signatures.clone() {
                 let card_frame = Frame::none()
                     .fill(ThemeColors::BG_CARD)
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(70, 70, 80)))
@@ -113,6 +169,7 @@ pub fn render_manage_signatures_tab(
                                 let hash = sig.blake3_hash.clone();
                                 let file_name = sig.file_name.clone();
                                 if shared_db.remove_and_save(&hash) {
+                                    state.dirty = true;
                                     logs.push(format!(
                                         "db   :: removed signature for file '{}' ({}) from local database",
                                         file_name,

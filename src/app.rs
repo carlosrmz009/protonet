@@ -1,9 +1,6 @@
 use crate::p2p::{P2pEvent, P2pHandle};
 use crate::signature::{FileSignature, SharedSignatureDb};
-use crate::ui::{
-    apply_theme, handle_file_chosen, render_red_alert_screen, NetworkState, ScannerState,
-    ThemeColors,
-};
+use crate::ui::{apply_theme, render_red_alert_screen, NetworkState, ScannerState, ThemeColors};
 use eframe::App;
 use egui::{Align, Color32, Frame, Layout, RichText, Rounding, Stroke, Vec2};
 use tokio::sync::mpsc;
@@ -25,6 +22,7 @@ pub struct ProtonetApp {
     pub topology_state: crate::ui::TopologyState,
     pub active_tab: AppTab,
     pub show_reset_identity_confirmation: bool,
+    pub manage_signatures_state: crate::ui::ManageSignaturesState,
 }
 
 impl ProtonetApp {
@@ -64,6 +62,7 @@ impl ProtonetApp {
             topology_state: crate::ui::TopologyState::default(),
             active_tab: AppTab::Scanner,
             show_reset_identity_confirmation: false,
+            manage_signatures_state: crate::ui::ManageSignaturesState::default(),
         }
     }
 
@@ -134,8 +133,21 @@ impl ProtonetApp {
                 P2pEvent::ReachabilityChanged { state } => self
                     .network_state
                     .push_log(format!("nat  :: reachability is {:?}", state)),
+                P2pEvent::StorageSafetyChanged { active, reason } => {
+                    self.network_state.push_log(if active {
+                        format!(
+                            "store:: STORAGE SAFETY MODE: {}",
+                            reason.unwrap_or_else(|| "storage unavailable".to_owned())
+                        )
+                    } else {
+                        "store:: storage safety mode cleared".to_owned()
+                    });
+                }
                 P2pEvent::LogMessage(msg) => {
                     self.network_state.push_log(format!("log  :: {}", msg));
+                }
+                P2pEvent::RelayReservation { relay_peer_id } => {
+                    self.network_state.push_log(format!("relay:: reservation active via {}", relay_peer_id));
                 }
             }
         }
@@ -145,6 +157,15 @@ impl ProtonetApp {
 impl App for ProtonetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_p2p_events();
+        if self.scanner_state.poll_hash(
+            &self.shared_db,
+            &self.p2p_handle,
+            &mut self.active_threat_alert,
+            &mut self.network_state.gossip_logs,
+        ) {
+            self.topology_state
+                .trigger_broadcast(self.p2p_handle.peer_count(), ctx);
+        }
 
         if let Some(signature) = self.active_threat_alert.clone() {
             let mut on_dismiss = false;
@@ -276,6 +297,20 @@ impl App for ProtonetApp {
 
                 match self.active_tab {
                     AppTab::Scanner => {
+                        ui.checkbox(
+                            &mut self.scanner_state.share_file_names,
+                            "Share file names with peers",
+                        );
+                        if self.scanner_state.hashing() {
+                            ui.add(
+                                egui::ProgressBar::new(self.scanner_state.hash_progress())
+                                    .show_percentage(),
+                            );
+                            if ui.button("Cancel hashing").clicked() {
+                                self.scanner_state.cancel_hash();
+                            }
+                            ui.add_space(8.0);
+                        }
                         let button_width = ui.available_width();
                         let choose_btn = egui::Button::new(
                             RichText::new("choose file...")
@@ -288,16 +323,7 @@ impl App for ProtonetApp {
 
                         if ui.add(choose_btn).clicked() {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
-                                handle_file_chosen(
-                                    path,
-                                    &self.shared_db,
-                                    &self.p2p_handle,
-                                    &mut self.scanner_state,
-                                    &mut self.active_threat_alert,
-                                    &mut self.network_state.gossip_logs,
-                                );
-                                let total_peers = self.p2p_handle.peer_count();
-                                self.topology_state.trigger_broadcast(total_peers, ctx);
+                                self.scanner_state.start_hash(path);
                             }
                         }
 
@@ -330,6 +356,7 @@ impl App for ProtonetApp {
                             ui,
                             &self.shared_db,
                             &mut self.network_state.gossip_logs,
+                            &mut self.manage_signatures_state,
                         );
                     }
                 }

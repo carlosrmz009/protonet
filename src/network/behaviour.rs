@@ -39,6 +39,7 @@ impl ProtonetBehaviour {
         relay_client: relay::client::Behaviour,
         enable_mdns: bool,
         enable_relay_server: bool,
+        enable_peer_scoring: bool,
     ) -> anyhow::Result<Self> {
         let peer_id = PeerId::from_public_key(&keypair.public());
         let topic = gossipsub::IdentTopic::new(crate::protocol::version::GOSSIP_TOPIC);
@@ -58,12 +59,23 @@ impl ProtonetBehaviour {
                     .unwrap_or_else(|_| *blake3::hash(&message.data).as_bytes());
                 gossipsub::MessageId::from(id.to_vec())
             });
-        gossip_config.set_topic_max_transmit_size(topic.hash(), MAX_ENCODED_RECORD_SIZE);
         let mut gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossip_config.build()?,
         )
         .map_err(|error| anyhow::anyhow!(error))?;
+        if enable_peer_scoring {
+            let mut score = gossipsub::PeerScoreParams::default();
+            let mut topic_score = gossipsub::TopicScoreParams::default();
+            topic_score.mesh_message_deliveries_weight = -1.0;
+            topic_score.mesh_message_deliveries_window = Duration::from_secs(60);
+            topic_score.mesh_message_deliveries_activation = Duration::from_secs(30);
+            topic_score.mesh_message_deliveries_cap = 100.0;
+            score.topics.insert(topic.hash(), topic_score);
+            gossipsub
+                .with_peer_score(score, gossipsub::PeerScoreThresholds::default())
+                .map_err(anyhow::Error::msg)?;
+        }
         gossipsub.subscribe(&topic)?;
 
         let store = kad::store::MemoryStore::with_config(
