@@ -6,7 +6,7 @@ description = "Native Windows True-P2P Threat Network with BLAKE3 Signature Flag
 authors = ["Antigravity & User"]
 
 [dependencies]
-eframe = "0.27"
+eframe = { version = "0.27", features = ["wgpu"] }
 egui = "0.27"
 egui_extras = "0.27"
 image = { version = "0.24", default-features = false, features = ["png"] }

@@ -6,16 +6,20 @@ use egui::{
     ViewportClass, ViewportId,
 };
 
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 pub struct BroadcastAnim {
     pub peer_index: usize,
     pub progress: f32,
     pub speed: f32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TopologyState {
     pub texture: Option<TextureHandle>,
-    pub active_animations: Vec<BroadcastAnim>,
+    pub active_animations: Arc<Mutex<Vec<BroadcastAnim>>>,
 }
 
 impl TopologyState {
@@ -39,26 +43,30 @@ impl TopologyState {
         handle
     }
 
-    pub fn trigger_broadcast(&mut self, total_peers: usize, ctx: &egui::Context) {
+    pub fn trigger_broadcast(&self, total_peers: usize, ctx: &egui::Context) {
+        let mut anims = self.active_animations.lock();
         for peer_index in 0..total_peers.max(1) {
-            self.active_animations.push(BroadcastAnim {
+            anims.push(BroadcastAnim {
                 peer_index,
                 progress: 0.0,
                 speed: 0.75,
             });
         }
+        drop(anims);
         ctx.request_repaint();
     }
 }
 
 pub fn render_topology_window(
     ctx: &egui::Context,
-    open: &mut bool,
+    open: &Arc<AtomicBool>,
     state: &mut TopologyState,
     p2p_handle: &P2pHandle,
 ) {
     let texture = state.get_or_load_texture(ctx);
     let snapshot = p2p_handle.snapshot();
+    let animations = state.active_animations.clone();
+    let open_flag = open.clone();
     let viewport_id = ViewportId::from_hash_of("peers_topology_window");
     let viewport_builder = ViewportBuilder::default()
         .with_title("Protonet network")
@@ -66,11 +74,10 @@ pub fn render_topology_window(
         .with_min_inner_size([650.0, 500.0])
         .with_icon(crate::ui::get_app_icon());
 
-    ctx.show_viewport_immediate(viewport_id, viewport_builder, move |ctx, class| {
-        if class == ViewportClass::Immediate
-            && ctx.input(|input| input.viewport().close_requested())
+    ctx.show_viewport_deferred(viewport_id, viewport_builder, move |ctx, class| {
+        if class == ViewportClass::Deferred && ctx.input(|input| input.viewport().close_requested())
         {
-            *open = false;
+            open_flag.store(false, Ordering::Relaxed);
         }
         egui::CentralPanel::default()
             .frame(
@@ -275,9 +282,10 @@ pub fn render_topology_window(
                         });
 
                     ui.add_space(16.0);
-                    draw_topology(ui, ctx, state, &texture, &snapshot);
+                    draw_topology(ui, ctx, &animations, &texture, &snapshot);
                 });
             });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     });
 }
 
@@ -307,7 +315,7 @@ fn short_peer(peer: &str) -> String {
 fn draw_topology(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
-    state: &mut TopologyState,
+    active_animations: &Arc<Mutex<Vec<BroadcastAnim>>>,
     texture: &TextureHandle,
     snapshot: &crate::network::NetworkSnapshot,
 ) {
@@ -337,7 +345,8 @@ fn draw_topology(
         );
     }
     let delta = ui.input(|input| input.unstable_dt).min(0.1);
-    for animation in &mut state.active_animations {
+    let mut anims = active_animations.lock();
+    for animation in anims.iter_mut() {
         let target = peer_positions
             .get(animation.peer_index % peer_positions.len().max(1))
             .copied()
@@ -349,10 +358,10 @@ fn draw_topology(
             Color32::from_rgb(100, 235, 80),
         );
     }
-    state
-        .active_animations
-        .retain(|animation| animation.progress <= 1.0);
-    if !state.active_animations.is_empty() {
+    anims.retain(|animation| animation.progress <= 1.0);
+    let has_animations = !anims.is_empty();
+    drop(anims);
+    if has_animations {
         ctx.request_repaint();
     }
 

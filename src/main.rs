@@ -47,6 +47,12 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1100.0, 750.0])
             .with_min_inner_size([800.0, 600.0])
             .with_icon(crate::ui::get_app_icon()),
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: eframe::egui_wgpu::wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: Some(2),
+            ..Default::default()
+        },
         ..Default::default()
     };
 

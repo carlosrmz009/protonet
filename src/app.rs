@@ -5,6 +5,9 @@ use eframe::App;
 use egui::{Align, Color32, Frame, Layout, RichText, Rounding, Stroke, Vec2};
 use tokio::sync::mpsc;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppTab {
     Scanner,
@@ -18,7 +21,7 @@ pub struct ProtonetApp {
     scanner_state: ScannerState,
     network_state: NetworkState,
     pub active_threat_alert: Option<FileSignature>,
-    pub show_peers_window: bool,
+    pub show_peers_window: Arc<AtomicBool>,
     pub topology_state: crate::ui::TopologyState,
     pub active_tab: AppTab,
     pub show_reset_identity_confirmation: bool,
@@ -58,7 +61,7 @@ impl ProtonetApp {
             scanner_state: ScannerState::default(),
             network_state,
             active_threat_alert: None,
-            show_peers_window: true,
+            show_peers_window: Arc::new(AtomicBool::new(true)),
             topology_state: crate::ui::TopologyState::default(),
             active_tab: AppTab::Scanner,
             show_reset_identity_confirmation: false,
@@ -200,10 +203,11 @@ impl App for ProtonetApp {
 
                         ui.add_space(16.0);
 
+                        let show_peers = self.show_peers_window.load(Ordering::Relaxed);
                         let topology_btn = egui::Button::new(
                             RichText::new("[peers]")
                                 .font(ThemeColors::font_regular(13.0))
-                                .color(if self.show_peers_window {
+                                .color(if show_peers {
                                     ThemeColors::TEXT_PRIMARY
                                 } else {
                                     ThemeColors::TEXT_MUTED
@@ -213,7 +217,7 @@ impl App for ProtonetApp {
                         .frame(false);
 
                         if ui.add(topology_btn).clicked() {
-                            self.show_peers_window = !self.show_peers_window;
+                            self.show_peers_window.fetch_xor(true, Ordering::Relaxed);
                         }
 
                         ui.add_space(8.0);
@@ -363,10 +367,10 @@ impl App for ProtonetApp {
                 }
             });
 
-        if self.show_peers_window {
+        if self.show_peers_window.load(Ordering::Relaxed) {
             crate::ui::render_topology_window(
                 ctx,
-                &mut self.show_peers_window,
+                &self.show_peers_window,
                 &mut self.topology_state,
                 &self.p2p_handle,
             );
