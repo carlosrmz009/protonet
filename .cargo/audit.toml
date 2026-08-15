@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # webbrowser: Unix `BROWSER` handling allows browser argument injection.
+    # protonet is a native Windows desktop application and does not use Unix BROWSER handling.
+    # Pulled in transitively via eframe/egui-winit 0.27.
+    "RUSTSEC-2026-0257",
+]
