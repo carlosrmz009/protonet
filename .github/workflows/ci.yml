@@ -5,6 +5,7 @@ on:
   pull_request:
   schedule:
     - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,7 +14,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -24,5 +25,24 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo check --manifest-path fuzz/Cargo.toml --bins
-      - run: cargo install cargo-audit --version 0.22.0 --locked
-      - run: cargo audit
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+      - name: Security audit (workspace & fuzz)
+        shell: pwsh
+        run: |
+          $auditFailed = $false
+          Write-Host "Auditing workspace root Cargo.lock..."
+          cargo audit
+          if ($LASTEXITCODE -ne 0) { $auditFailed = $true }
+
+          Write-Host "Auditing fuzz/Cargo.lock..."
+          cargo audit --file fuzz/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { $auditFailed = $true }
+
+          if ($auditFailed) {
+            Write-Error "cargo audit found vulnerabilities."
+            if ($env:GITHUB_STEP_SUMMARY) {
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ⚠️ Security Audit Failure`n`nA vulnerability was detected in the locked dependencies. Check if running ``cargo update`` or Dependabot PRs resolve it, or verify if an advisory ignore is needed in ``.cargo/audit.toml``."
+            }
+            exit 1
+          }

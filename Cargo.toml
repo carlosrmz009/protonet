@@ -45,7 +45,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "6348a0be4ae
     "ed25519",
 ] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-lru = "0.16"
+lru = "0.18"
 directories = "6"
 thiserror = "2"
 hdrhistogram = "7"
