@@ -7,7 +7,7 @@ authors = ["Antigravity & User"]
 
 [dependencies]
 eframe = { version = "0.27", features = ["wgpu"] }
-egui = "0.27"
+egui = "0.35"
 egui_extras = "0.27"
 image = { version = "0.24", default-features = false, features = ["png"] }
 tokio = { version = "1.37", features = ["full"] }
