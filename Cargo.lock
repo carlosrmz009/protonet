@@ -4707,7 +4707,7 @@ dependencies = [
  "rfd",
  "rusqlite",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
