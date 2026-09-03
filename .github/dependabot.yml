@@ -9,6 +9,21 @@ updates:
     labels:
       - "dependencies"
       - "security"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Major breaking UI framework versions require coordinated manual migration
+      - dependency-name: "egui"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "eframe"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "egui_extras"
+        update-types: ["version-update:semver-major"]
 
   # Maintain dependencies for the fuzzing harness
   - package-ecosystem: "cargo"
@@ -19,6 +34,13 @@ updates:
     labels:
       - "dependencies"
       - "fuzz"
+    groups:
+      fuzz-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   # Maintain GitHub Actions workflows
   - package-ecosystem: "github-actions"
@@ -28,3 +50,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
