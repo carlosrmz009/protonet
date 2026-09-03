@@ -9,7 +9,7 @@ authors = ["Antigravity & User"]
 eframe = { version = "0.27", features = ["wgpu"] }
 egui = "0.27"
 egui_extras = "0.27"
-image = { version = "0.24", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio = { version = "1.37", features = ["full"] }
 bytes = "1.5"
 futures = "0.3"
